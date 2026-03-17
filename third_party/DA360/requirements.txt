@@ -1,0 +1,18 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.1.1
+torchvision==0.16.1
+xformers==0.0.23
+gradio_imageslider
+gradio==4.29.0
+matplotlib
+tensorboard
+scipy
+tqdm
+opt_einsum
+imageio
+scikit-image
+pillow
+timm
+gdown
+open3d
+ipdb

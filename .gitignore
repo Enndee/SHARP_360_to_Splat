@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+release_pkg/
+easy_360_sharp_gui_settings.json
+SHARP_360_to_Splat.spec
+splatapult/build/
+Gaussian_Decimator/
+_decimator_smoketest/
+sharp_360_to_splat.log
+checkpoints/
+Temp/
+**/Temp/
+Example files/*_merged.*
+Example files/*_depth.png
+Example files/*_intermediates/

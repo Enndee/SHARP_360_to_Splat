@@ -1,0 +1,4 @@
+[submodule "splatapult"]
+	path = splatapult
+	url = https://github.com/Enndee/splatapult.git
+	branch = feature/spz-format-support
