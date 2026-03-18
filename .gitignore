@@ -16,3 +16,6 @@ Temp/
 Example files/*_merged.*
 Example files/*_depth.png
 Example files/*_intermediates/
+models/SEEDVR2/
+seedvr2_videoupscaler/
+.gitattributes

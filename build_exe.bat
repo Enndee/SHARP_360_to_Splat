@@ -3,6 +3,12 @@ setlocal EnableDelayedExpansion
 
 set "APP_NAME=SHARP_360_to_Splat"
 set "RELEASE_VERSION=1.5.1"
+set "SCRIPT_DIR=%~dp0"
+if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+cd /d "%SCRIPT_DIR%"
+
+set "VENV_DIR=%SCRIPT_DIR%\.venv"
+set "SHARP_PY=%VENV_DIR%\Scripts\python.exe"
 set "PACKAGE_DIR=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows"
 set "ZIP_PATH=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows.zip"
 set "VIEWER_SOURCE=splatapult\build\Release"
@@ -12,31 +18,16 @@ echo  SHARP_360_to_Splat  --  Build EXE
 echo =====================================================
 echo.
 
-REM ── Locate the 'sharp' conda environment ─────────────────────────────────
-set "SHARP_PY="
-for %%B in (
-    "%USERPROFILE%\anaconda3"
-    "%USERPROFILE%\miniconda3"
-    "%LOCALAPPDATA%\anaconda3"
-    "%LOCALAPPDATA%\miniconda3"
-) do (
-    if exist "%%~B\envs\sharp\python.exe" (
-        set "SHARP_PY=%%~B\envs\sharp\python.exe"
-        set "SHARP_SCRIPTS=%%~B\envs\sharp\Scripts"
-        goto :found_env
-    )
+if not exist "%SHARP_PY%" (
+    echo ERROR: Could not find the local .venv interpreter.
+    echo        Run Setup_NewPC.bat first to create it.
+    pause
+    exit /b 1
 )
 
-echo ERROR: Could not find the 'sharp' conda environment.
-echo        Run Setup_NewPC.bat first to create it.
-pause
-exit /b 1
-
-:found_env
-echo [1/5] Found sharp env: %SHARP_PY%
+echo [1/5] Found local venv: %SHARP_PY%
 echo.
 
-REM ── Install PyInstaller into the sharp env ────────────────────────────────
 echo [2/5] Installing PyInstaller...
 "%SHARP_PY%" -m pip install pyinstaller --quiet
 if errorlevel 1 (
@@ -45,44 +36,40 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM ── Locate Tcl/Tk libraries (must match the version _tkinter.pyd was built with)
-set "CONDA_BASE="
-for %%B in (
-    "%USERPROFILE%\anaconda3"
-    "%USERPROFILE%\miniconda3"
-    "%LOCALAPPDATA%\anaconda3"
-    "%LOCALAPPDATA%\miniconda3"
-) do (
-    if exist "%%~B\envs\sharp\python.exe" (
-        set "CONDA_BASE=%%~B"
-        goto :found_conda
-    )
+set "PYTHON_BASE="
+set "TCL_LIBRARY="
+set "TK_LIBRARY="
+for /f "usebackq tokens=1,2,3 delims=|" %%A in (`"%SHARP_PY%" -c "import sys, pathlib; base=pathlib.Path(sys.base_prefix); print(str(base) + '|' + str(base / 'tcl' / 'tcl8.6') + '|' + str(base / 'tcl' / 'tk8.6'))"`) do (
+    set "PYTHON_BASE=%%~A"
+    set "TCL_LIBRARY=%%~B"
+    set "TK_LIBRARY=%%~C"
 )
-:found_conda
-set "TCL_LIBRARY=%CONDA_BASE%\envs\sharp\Library\lib\tcl8.6"
-set "TK_LIBRARY=%CONDA_BASE%\envs\sharp\Library\lib\tk8.6"
+
+if not defined PYTHON_BASE (
+    echo ERROR: Could not determine the base Python installation for the venv.
+    pause
+    exit /b 1
+)
+
+echo       Base Python = %PYTHON_BASE%
 echo       TCL_LIBRARY=%TCL_LIBRARY%
 echo       TK_LIBRARY=%TK_LIBRARY%
+set "PATH=%PYTHON_BASE%;%PYTHON_BASE%\DLLs;%PATH%"
 
-REM Put the sharp env's Library\bin FIRST on PATH so PyInstaller picks up the
-REM correct tcl86t.dll (8.6.15) rather than the base conda's (8.6.14).
-set "PATH=%CONDA_BASE%\envs\sharp\Library\bin;%PATH%"
-
-REM ── Build the exe ─────────────────────────────────────────────────────────
 echo.
 echo [3/5] Building %APP_NAME%.exe ...
-"%SHARP_SCRIPTS%\pyinstaller.exe" ^
+"%SHARP_PY%" -m PyInstaller ^
     --onefile ^
     --windowed ^
     --name "%APP_NAME%" ^
     --hidden-import plyfile ^
     --hidden-import numpy ^
-     --hidden-import PIL ^
-     --hidden-import PIL.Image ^
-     --hidden-import PIL.ImageOps ^
-     --hidden-import PIL.ImageTk ^
+    --hidden-import PIL ^
+    --hidden-import PIL.Image ^
+    --hidden-import PIL.ImageOps ^
+    --hidden-import PIL.ImageTk ^
     --collect-all plyfile ^
-     --collect-all PIL ^
+    --collect-all PIL ^
     --add-data "%TCL_LIBRARY%;tcl" ^
     --add-data "%TK_LIBRARY%;tk" ^
     "Easy_360_SHARP_GUI.py"
@@ -93,7 +80,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM ── Assemble distribution folder ──────────────────────────────────────────
 echo.
 echo [4/5] Assembling release package...
 
@@ -106,7 +92,7 @@ if errorlevel 1 (
 )
 
 copy /Y "dist\%APP_NAME%.exe" "%PACKAGE_DIR%\" >nul
-copy /Y "Launch_SHARP_360_to_Splat.bat" "%PACKAGE_DIR%\" >nul
+copy /Y "!Launch_SHARP_360_to_Splat.bat" "%PACKAGE_DIR%\" >nul
 copy /Y "Setup_NewPC.bat" "%PACKAGE_DIR%\" >nul
 copy /Y "gsbox.exe" "%PACKAGE_DIR%\" >nul
 
@@ -132,30 +118,29 @@ if exist "%VIEWER_SOURCE%\*" (
 
 if exist "easy_360_sharp_gui_settings.json" del /Q "%PACKAGE_DIR%\easy_360_sharp_gui_settings.json" >nul 2>&1
 
-REM Write a quick README
 (
     echo SHARP_360_to_Splat
     echo ====================
     echo.
     echo REQUIREMENTS FOR A NEW PC
-    echo   1. Windows 11, NVIDIA GPU (RTX 20/30/40/50 series with CUDA)
-    echo   2. Anaconda or Miniconda - https://www.anaconda.com/download
+    echo   1. Windows 11, NVIDIA GPU ^(RTX 20/30/40/50 series with CUDA^)
+    echo   2. Python 3.13          - https://www.python.org/downloads/windows/
     echo   3. Git for Windows      - https://git-scm.com/download/win
     echo.
-    echo SETUP (first time only^)
-    echo   Run Setup_NewPC.bat  -- installs the SHARP conda environment.
+    echo SETUP ^(first time only^)
+    echo   Run Setup_NewPC.bat  -- creates the local .venv, clones SeedVR2, and installs dependencies.
     echo.
     echo USAGE
     echo   - Double-click SHARP_360_to_Splat.exe and use the file picker, OR
     echo   - Right-click any JPEG/PNG -^> Send To -^> SHARP_360_to_Splat
-    echo     (Setup_NewPC.bat creates the Send To shortcut automatically^)
+    echo     ^(Setup_NewPC.bat creates the Send To shortcut automatically^)
     echo   - DA360 depth alignment is enabled by default when checkpoints\DA360_large.pth is present
     echo   - Double-click splat files in the GUI to open them in the configured viewer
     echo.
     echo FOLDER STRUCTURE
     echo   SHARP_360_to_Splat.exe    - launcher
     echo   gsbox.exe                 - format conversion helper
-    echo   Launch_SHARP_360_to_Splat.bat - script launcher
+    echo   !Launch_SHARP_360_to_Splat.bat - script launcher
     echo   Setup_NewPC.bat           - one-time environment installer
     echo   third_party\DA360\       - vendored DA360 inference code
     echo   checkpoints\DA360_large.pth - default DA360 checkpoint

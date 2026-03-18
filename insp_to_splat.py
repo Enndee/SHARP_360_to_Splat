@@ -4,6 +4,7 @@ import argparse
 import importlib
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,10 @@ LOCAL_DA360_ROOT = resolve_resource_path("third_party", "DA360")
 DEFAULT_CONFIG_PATH = resolve_resource_path("insp_settings.json")
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
 DEFAULT_DA360_CHECKPOINT_PATH = resolve_resource_path("checkpoints", "DA360_large.pth")
+GUI_SETTINGS_PATH = resolve_resource_path("easy_360_sharp_gui_settings.json")
+SEEDVR2_SETTINGS_PATH = resolve_resource_path("seedvr2_settings.json")
+SEEDVR2_CLI_PATH = resolve_resource_path("seedvr2_videoupscaler", "inference_cli.py")
+DEFAULT_IMAGEMAGICK_COMMANDS = "-auto-level -auto-gamma -normalize -enhance -despeckle -unsharp 0x1.2+0.8+0.02"
 SUPPORTED_INPUT_SUFFIXES = {".jpg", ".jpeg", ".png", ".heic"}
 COMPRESSED_OUTPUT_SUFFIXES = {".spx", ".spz", ".sog"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -186,6 +191,28 @@ def parse_args() -> argparse.Namespace:
         help="Path to gsbox.exe for compressed output conversion.",
     )
     parser.add_argument(
+        "--enable-seedvr2-upscale",
+        action="store_true",
+        help="Sharpen the panorama and upscale extracted face images with SeedVR2 before SHARP prediction.",
+    )
+    parser.add_argument(
+        "--enable-imagemagick-optimization",
+        action="store_true",
+        help="Optimize the panorama with ImageMagick before slicing it into SHARP views.",
+    )
+    parser.add_argument(
+        "--imagemagick",
+        type=Path,
+        default=None,
+        help="Optional path to magick.exe. Uses PATH when omitted.",
+    )
+    parser.add_argument(
+        "--imagemagick-commands",
+        type=str,
+        default=DEFAULT_IMAGEMAGICK_COMMANDS,
+        help="ImageMagick command string applied before slicing.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -201,6 +228,181 @@ def load_config(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"Config file must contain an object: {path}")
     return data
+
+
+def load_seedvr2_settings() -> dict:
+    settings = load_config(SEEDVR2_SETTINGS_PATH)
+    gui_settings = load_config(GUI_SETTINGS_PATH)
+    if not gui_settings:
+        return settings
+
+    seedvr2_keys = {
+        "model_name": "seedvr2_model_name",
+        "output_format": "seedvr2_output_format",
+        "color_correction": "seedvr2_color_correction",
+        "attention_mode": "seedvr2_attention_mode",
+        "cuda_device": "seedvr2_cuda_device",
+        "dit_offload_device": "seedvr2_dit_offload_device",
+        "vae_offload_device": "seedvr2_vae_offload_device",
+        "tensor_offload_device": "seedvr2_tensor_offload_device",
+        "resolution_factor": "seedvr2_resolution_factor",
+        "max_resolution": "seedvr2_max_resolution",
+        "batch_size": "seedvr2_batch_size",
+        "seed": "seedvr2_seed",
+        "skip_first_frames": "seedvr2_skip_first_frames",
+        "blocks_to_swap": "seedvr2_blocks_to_swap",
+        "vae_encode_tile_size": "seedvr2_vae_encode_tile_size",
+        "vae_encode_tile_overlap": "seedvr2_vae_encode_tile_overlap",
+        "vae_decode_tile_size": "seedvr2_vae_decode_tile_size",
+        "vae_decode_tile_overlap": "seedvr2_vae_decode_tile_overlap",
+        "compile_backend": "seedvr2_compile_backend",
+        "compile_mode": "seedvr2_compile_mode",
+        "swap_io_components": "seedvr2_swap_io_components",
+        "vae_encode_tiled": "seedvr2_vae_encode_tiled",
+        "vae_decode_tiled": "seedvr2_vae_decode_tiled",
+        "cache_dit": "seedvr2_cache_dit",
+        "cache_vae": "seedvr2_cache_vae",
+        "debug_enabled": "seedvr2_debug_enabled",
+    }
+    for target_key, gui_key in seedvr2_keys.items():
+        if gui_key in gui_settings:
+            settings[target_key] = gui_settings[gui_key]
+    return settings
+
+
+def find_imagemagick_executable(path_value: str | Path | None) -> Path | None:
+    resolved = resolve_optional_path(path_value)
+    if resolved is not None:
+        if resolved.exists():
+            return resolved
+        return None
+    magick_on_path = shutil.which("magick")
+    if magick_on_path:
+        return Path(magick_on_path)
+    return None
+
+
+def optimize_panorama_with_imagemagick(
+    panorama: np.ndarray,
+    temp_root: Path,
+    magick_path: Path,
+    command_string: str,
+) -> np.ndarray:
+    preprocess_dir = temp_root / "preprocess"
+    preprocess_dir.mkdir(parents=True, exist_ok=True)
+    input_path = preprocess_dir / "panorama_input.png"
+    output_path = preprocess_dir / "panorama_optimized.png"
+    Image.fromarray(panorama).save(input_path)
+
+    command = [str(magick_path), str(input_path), *shlex.split(command_string), str(output_path)]
+    LOGGER.info("Running ImageMagick optimization: %s", " ".join(command))
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        output = output.strip()
+        if output:
+            raise RuntimeError(f"ImageMagick optimization failed with exit code {result.returncode}:\n{output}")
+        raise RuntimeError(f"ImageMagick optimization failed with exit code {result.returncode}.")
+
+    with Image.open(output_path) as image:
+        optimized = image.convert("RGB")
+        return np.asarray(optimized).copy()
+
+
+def sharpen_panorama(image: np.ndarray) -> np.ndarray:
+    from PIL import ImageFilter
+
+    pil_img = Image.fromarray(image)
+    sharpened = pil_img.filter(ImageFilter.UnsharpMask(radius=2, percent=100, threshold=2))
+    return np.asarray(sharpened)
+
+
+def upscale_faces_with_seedvr2(
+    faces: dict[str, np.ndarray],
+    face_size: int,
+    temp_root: Path,
+) -> tuple[dict[str, np.ndarray], int]:
+    settings = load_seedvr2_settings()
+    factor = int(settings.get("resolution_factor", 2))
+    target_resolution = face_size * factor
+
+    input_dir = temp_root / "seedvr2_input"
+    output_dir = temp_root / "seedvr2_output"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for name, image_array in faces.items():
+        Image.fromarray(image_array).save(input_dir / f"{name}.png")
+
+    python_exe = sys.executable
+    cmd: list[str] = [
+        python_exe, str(SEEDVR2_CLI_PATH),
+        str(input_dir),
+        "--output", str(output_dir),
+        "--output_format", "png",
+        "--resolution", str(target_resolution),
+        "--dit_model", settings.get("model_name", "seedvr2_ema_3b_fp8_e4m3fn.safetensors"),
+        "--color_correction", settings.get("color_correction", "lab"),
+        "--attention_mode", settings.get("attention_mode", "sdpa"),
+        "--batch_size", str(settings.get("batch_size", "1")),
+        "--seed", str(settings.get("seed", "42")),
+        "--blocks_to_swap", str(settings.get("blocks_to_swap", "0")),
+        "--dit_offload_device", settings.get("dit_offload_device", "none"),
+        "--vae_offload_device", settings.get("vae_offload_device", "none"),
+        "--tensor_offload_device", settings.get("tensor_offload_device", "cpu"),
+        "--compile_backend", settings.get("compile_backend", "inductor"),
+        "--compile_mode", settings.get("compile_mode", "default"),
+    ]
+
+    max_res = int(settings.get("max_resolution", 0))
+    if max_res > 0:
+        cmd += ["--max_resolution", str(max_res)]
+
+    cuda_device = settings.get("cuda_device")
+    if cuda_device:
+        cmd += ["--cuda_device", str(cuda_device)]
+
+    if settings.get("swap_io_components", False):
+        cmd.append("--swap_io_components")
+    if settings.get("vae_encode_tiled", False):
+        cmd += [
+            "--vae_encode_tiled",
+            "--vae_encode_tile_size", str(settings.get("vae_encode_tile_size", "1024")),
+            "--vae_encode_tile_overlap", str(settings.get("vae_encode_tile_overlap", "128")),
+        ]
+    if settings.get("vae_decode_tiled", False):
+        cmd += [
+            "--vae_decode_tiled",
+            "--vae_decode_tile_size", str(settings.get("vae_decode_tile_size", "1024")),
+            "--vae_decode_tile_overlap", str(settings.get("vae_decode_tile_overlap", "128")),
+        ]
+    if settings.get("cache_dit", False):
+        cmd.append("--cache_dit")
+    if settings.get("cache_vae", False):
+        cmd.append("--cache_vae")
+    if settings.get("debug_enabled", False):
+        cmd.append("--debug")
+
+    LOGGER.info(
+        "Running SeedVR2 upscale: %d faces, %dx%d -> %dx%d (factor %d)",
+        len(faces), face_size, face_size, target_resolution, target_resolution, factor,
+    )
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "")[-2000:]
+        raise RuntimeError(f"SeedVR2 upscale failed (exit {result.returncode}):\n{stderr_tail}")
+
+    upscaled: dict[str, np.ndarray] = {}
+    for name in faces:
+        out_path = output_dir / f"{name}.png"
+        if not out_path.exists():
+            raise FileNotFoundError(f"SeedVR2 did not produce expected output: {out_path}")
+        with Image.open(out_path) as img:
+            upscaled[name] = np.asarray(img.convert("RGB")).copy()
+
+    new_face_size = upscaled[next(iter(upscaled))].shape[0]
+    LOGGER.info("SeedVR2 upscale complete. New face size: %dx%d", new_face_size, new_face_size)
+    return upscaled, new_face_size
 
 
 def configure_logging(verbose: bool) -> None:
@@ -845,11 +1047,22 @@ def convert_with_gsbox(
     sh_degree: int,
     gsbox_path: Path,
 ) -> None:
+    from plyfile import PlyData
+
+    # gsbox rejects SHARP's richer PLY exports when extra metadata elements are
+    # present after the vertex payload. For compressed conversion, rewrite the
+    # temporary PLY to a minimal vertex-only form that preserves the Gaussian
+    # attributes but drops SHARP-specific metadata blocks.
+    ply_data = PlyData.read(source_ply)
+    vertex_element = ply_data["vertex"]
+    gsbox_source_ply = source_ply.with_name(f"{source_ply.stem}_gsbox.ply")
+    PlyData([vertex_element], text=False).write(gsbox_source_ply)
+
     command = [
         str(gsbox_path),
         f"ply2{output_format}",
         "-i",
-        str(source_ply),
+        str(gsbox_source_ply),
         "-o",
         str(output_path),
         "-sh",
@@ -858,7 +1071,13 @@ def convert_with_gsbox(
     if output_format in COMPRESSED_OUTPUT_SUFFIXES:
         command.extend(["-q", str(quality)])
     LOGGER.info("Running gsbox conversion: %s", " ".join(command))
-    subprocess.run(command, check=True)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        output = output.strip()
+        if output:
+            raise RuntimeError(f"gsbox conversion failed with exit code {result.returncode}:\n{output}")
+        raise RuntimeError(f"gsbox conversion failed with exit code {result.returncode}.")
 
 
 def save_depth_visualization(depth: np.ndarray, save_path: Path) -> None:
@@ -937,9 +1156,25 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
     device = resolve_device(args.device)
     LOGGER.info("Using device: %s", device)
 
+    temp_root = choose_temp_root(args)
     register_optional_image_plugins()
     panorama = load_input_panorama(args.input)
     panorama_width, panorama_height = validate_equirectangular_shape(panorama)
+    seedvr2_upscale_enabled = getattr(args, "enable_seedvr2_upscale", False)
+    imagemagick_optimization_enabled = getattr(args, "enable_imagemagick_optimization", False)
+
+    if imagemagick_optimization_enabled:
+        magick_path = find_imagemagick_executable(getattr(args, "imagemagick", None))
+        if magick_path is None:
+            raise FileNotFoundError("ImageMagick optimization is enabled, but magick.exe was not found. Provide --imagemagick or add ImageMagick to PATH.")
+        imagemagick_commands = getattr(args, "imagemagick_commands", DEFAULT_IMAGEMAGICK_COMMANDS) or DEFAULT_IMAGEMAGICK_COMMANDS
+        LOGGER.info("Optimizing panorama with ImageMagick before slicing.")
+        panorama = optimize_panorama_with_imagemagick(panorama, temp_root, magick_path, imagemagick_commands)
+        panorama_width, panorama_height = validate_equirectangular_shape(panorama)
+    elif seedvr2_upscale_enabled:
+        LOGGER.info("Applying sharpening to panorama before face extraction.")
+        panorama = sharpen_panorama(panorama)
+
     face_size = resolve_face_size(args.face_size, panorama_width, side_count, config)
     extraction_layout = build_extraction_layout(face_size, side_count, config)
     focal_px = extraction_layout.focal_px
@@ -956,10 +1191,16 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
     )
 
     faces = extract_perspective_views(extraction_layout, panorama, face_size)
-    temp_root = choose_temp_root(args)
     intermediate_dir = choose_intermediate_dir(args, output_path)
     if intermediate_dir is not None:
         save_intermediate_face_images(faces, intermediate_dir / "faces")
+
+    if seedvr2_upscale_enabled:
+        original_face_size = face_size
+        faces, face_size = upscale_faces_with_seedvr2(faces, face_size, temp_root)
+        focal_px = extraction_layout.focal_px * (face_size / original_face_size)
+        if intermediate_dir is not None:
+            save_intermediate_face_images(faces, intermediate_dir / "faces_upscaled")
 
     depth_map_path: Path | None = None
     reference_depth_views: dict[str, np.ndarray] = {}
@@ -967,7 +1208,10 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
         LOGGER.info("Running DA360 panorama depth inference using checkpoint %s", da360_checkpoint_path)
         da360_predictor = build_da360_predictor(da360_checkpoint_path, device)
         reference_depth_panorama = predict_da360_disparity_panorama(da360_predictor, panorama, device)
-        reference_depth_views = extract_perspective_scalar_views(extraction_layout, reference_depth_panorama, face_size)
+        reference_depth_views = {
+            view.name: extract_perspective_scalar_view(reference_depth_panorama, face_size, focal_px, view)
+            for view in extraction_layout.views
+        }
         del da360_predictor
         if device.type == "cuda":
             torch.cuda.empty_cache()

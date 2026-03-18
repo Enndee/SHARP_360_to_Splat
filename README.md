@@ -17,21 +17,22 @@ The pipeline can optionally normalize SHARP's per-view depth scale with Insta360
 
 ## New PC Setup
 
-1. Install Anaconda or Miniconda.
+1. Install Python 3.13.
 2. Install Git for Windows.
-3. Run `Setup_NewPC.bat`.
-4. Start `SHARP_360_to_Splat.exe` or `Launch_SHARP_360_to_Splat.bat`.
+3. Install ImageMagick if you want panorama optimization in the GUI.
+4. Run `Setup_NewPC.bat`.
+5. Start `SHARP_360_to_Splat.exe` or `!Launch_SHARP_360_to_Splat.bat`.
 
-`Setup_NewPC.bat` now also downloads the default DA360 checkpoint used for depth alignment.
+`Setup_NewPC.bat` creates a local `.venv`, installs PyTorch CUDA 12.8, installs the vendored `ml-sharp` package in editable mode, clones or updates `seedvr2_videoupscaler` from its upstream GitHub repo, installs the DA360 and SeedVR2 runtime extras used by this repo plus `triton-windows<3.5`, and downloads the default DA360 checkpoint used for depth alignment. It also supports `--dry-run` and `--skip-checkpoint`.
 
 ## Build
 
-Run `build_exe.bat` from a machine where the `sharp` conda environment already exists. The script builds the executable and assembles a versioned release package under `release_pkg/`.
+Run `build_exe.bat` from a machine where the repo's local `.venv` already exists. The script builds the executable and assembles a versioned release package under `release_pkg/`.
 
 ## Release Package Contents
 
 - `SHARP_360_to_Splat.exe`
-- `Launch_SHARP_360_to_Splat.bat`
+- `!Launch_SHARP_360_to_Splat.bat`
 - `Setup_NewPC.bat`
 - `gsbox.exe`
 - `third_party/DA360/`
