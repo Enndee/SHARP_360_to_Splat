@@ -11,6 +11,10 @@ set "TORCH_PINNED=torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0"
 set "TRITON_PINNED=triton-windows<3.5"
 set "SEEDVR2_REPO=https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
 set "SEEDVR2_DIR=%SCRIPT_DIR%\seedvr2_videoupscaler"
+set "THIRD_PARTY_DIR=%SCRIPT_DIR%\third_party"
+set "IMAGEMAGICK_DIR=%THIRD_PARTY_DIR%\ImageMagick"
+set "IMAGEMAGICK_BOOTSTRAP_DIR=%THIRD_PARTY_DIR%\_downloads"
+set "IMAGEMAGICK_INSTALLER=%IMAGEMAGICK_BOOTSTRAP_DIR%\ImageMagick-installer.exe"
 set "CHECKPOINT_DIR=%SCRIPT_DIR%\checkpoints"
 set "CHECKPOINT_PATH=%CHECKPOINT_DIR%\DA360_large.pth"
 set "CHECKPOINT_URL=https://drive.google.com/uc?id=1NYF4yJR83HEtxzOURLdmONeUe413auP6"
@@ -40,8 +44,9 @@ echo   2. Create or reuse a local .venv
 echo   3. Install PyTorch CUDA 12.8 wheels
 echo   4. Install the vendored ml-sharp package into the venv
 echo   5. Clone or update SeedVR2 and install runtime extras
-echo   6. Download the default DA360 checkpoint for depth alignment
-echo   7. Create a Send To shortcut for SHARP_360_to_Splat
+echo   6. Install ImageMagick into third_party\ImageMagick
+echo   7. Download the default DA360 checkpoint for depth alignment
+echo   8. Create a Send To shortcut for SHARP_360_to_Splat
 echo.
 echo The environment layout matches the portable SeedVR2 setup style:
 echo   .venv\Scripts\python.exe
@@ -71,7 +76,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [1/7] Checking for git...
+echo [1/8] Checking for git...
 where git >nul 2>&1
 if errorlevel 1 (
     echo.
@@ -87,7 +92,7 @@ if errorlevel 1 (
 echo       OK - git found.
 
 echo.
-echo [2/7] Creating or reusing local virtual environment...
+echo [2/8] Creating or reusing local virtual environment...
 if exist "%PYTHON_EXE%" (
     echo       Reusing existing virtual environment: "%VENV_DIR%"
 ) else (
@@ -104,7 +109,7 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
 echo.
-echo [3/7] Upgrading pip tooling...
+echo [3/8] Upgrading pip tooling...
 if "%DRY_RUN%"=="1" (
     echo       [dry-run] "%PYTHON_EXE%" -m pip install --upgrade pip setuptools wheel
 ) else (
@@ -113,7 +118,7 @@ if "%DRY_RUN%"=="1" (
 )
 
 echo.
-echo [4/7] Installing PyTorch with CUDA 12.8 support...
+echo [4/8] Installing PyTorch with CUDA 12.8 support...
 echo       IMPORTANT: This must happen before ml-sharp to avoid CPU-only torch.
 echo       This may take a few minutes...
 if "%DRY_RUN%"=="1" (
@@ -131,7 +136,7 @@ if "%DRY_RUN%"=="1" (
 )
 
 echo.
-echo [5/7] Installing SHARP_360_to_Splat runtime dependencies...
+echo [5/8] Installing SHARP_360_to_Splat runtime dependencies...
 echo       Installing local vendored ml-sharp in editable mode...
 if "%DRY_RUN%"=="1" (
     echo       [dry-run] "%PYTHON_EXE%" -m pip install -e "%SCRIPT_DIR%\ml-sharp"
@@ -172,14 +177,43 @@ if "%DRY_RUN%"=="1" (
     echo       OK - runtime dependencies installed.
 )
 
-where magick >nul 2>&1
-if errorlevel 1 (
-    echo       NOTE: ImageMagick was not found in PATH.
-    echo             Panorama optimization in the GUI will need magick.exe installed or selected manually.
+echo.
+echo [6/8] Ensuring ImageMagick is available...
+if exist "%IMAGEMAGICK_DIR%\magick.exe" (
+    echo       OK - using repo-managed ImageMagick at "%IMAGEMAGICK_DIR%".
+) else if "%DRY_RUN%"=="1" (
+    echo       [dry-run] mkdir "%THIRD_PARTY_DIR%"
+    echo       [dry-run] mkdir "%IMAGEMAGICK_BOOTSTRAP_DIR%"
+    echo       [dry-run] download latest ImageMagick x64 installer from the official GitHub release API
+    echo       [dry-run] install silently into "%IMAGEMAGICK_DIR%"
+) else (
+    if not exist "%THIRD_PARTY_DIR%" mkdir "%THIRD_PARTY_DIR%"
+    if not exist "%IMAGEMAGICK_BOOTSTRAP_DIR%" mkdir "%IMAGEMAGICK_BOOTSTRAP_DIR%"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$ProgressPreference = 'SilentlyContinue'; " ^
+        "$release = Invoke-RestMethod 'https://api.github.com/repos/ImageMagick/ImageMagick/releases/latest'; " ^
+        "$asset = $release.assets | Where-Object { $_.name -match 'Q16-HDRI-x64-dll\.exe$|Q16-x64-dll\.exe$|Q8-x64-dll\.exe$' } | Select-Object -First 1; " ^
+        "if (-not $asset) { throw 'Could not find the latest ImageMagick x64 installer asset.' }; " ^
+        "Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile '%IMAGEMAGICK_INSTALLER%'"
+    if errorlevel 1 (
+        echo       WARNING: Could not download the latest ImageMagick installer.
+        echo                Panorama optimization will fall back to PATH or manual selection.
+    ) else (
+        echo       Installing ImageMagick into "%IMAGEMAGICK_DIR%"...
+        "%IMAGEMAGICK_INSTALLER%" /SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="%IMAGEMAGICK_DIR%"
+        if errorlevel 1 (
+            echo       WARNING: ImageMagick installation into third_party failed.
+            echo                The GUI can still browse to magick.exe manually later.
+        ) else if exist "%IMAGEMAGICK_DIR%\magick.exe" (
+            echo       OK - repo-managed ImageMagick installed.
+        ) else (
+            echo       WARNING: ImageMagick installer completed, but magick.exe was not found in "%IMAGEMAGICK_DIR%".
+        )
+    )
 )
 
 echo.
-echo [6/7] Downloading the default DA360 checkpoint...
+echo [7/8] Downloading the default DA360 checkpoint...
 if "%SKIP_CHECKPOINT%"=="1" (
     echo       Skipping checkpoint download.
 ) else if exist "%CHECKPOINT_PATH%" (
@@ -201,7 +235,7 @@ if "%SKIP_CHECKPOINT%"=="1" (
 )
 
 echo.
-echo [7/7] Creating Send To shortcut...
+echo [8/8] Creating Send To shortcut...
 set "EXE_PATH=%SCRIPT_DIR%\SHARP_360_to_Splat.exe"
 if not exist "%EXE_PATH%" (
     echo       WARNING: SHARP_360_to_Splat.exe was not found next to this script.

@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,10 +56,10 @@ def load_settings() -> dict:
         "intermediate_dir": "",
         "enable_da360_alignment": True,
         "keep_intermediates": False,
+        "delete_temp_files": True,
         "enable_seedvr2_upscale": False,
         "enable_imagemagick_optimization": True,
         "imagemagick_path": "",
-        "imagemagick_commands": insp_to_splat.DEFAULT_IMAGEMAGICK_COMMANDS,
         "seedvr2_model_name": str(SEEDVR2_DEFAULTS.get("model_name", "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors")),
         "seedvr2_output_format": str(SEEDVR2_DEFAULTS.get("output_format", "png")),
         "seedvr2_color_correction": str(SEEDVR2_DEFAULTS.get("color_correction", "lab")),
@@ -86,14 +87,19 @@ def load_settings() -> dict:
         "seedvr2_cache_vae": bool(SEEDVR2_DEFAULTS.get("cache_vae", True)),
         "seedvr2_debug_enabled": bool(SEEDVR2_DEFAULTS.get("debug_enabled", False)),
     }
+    defaults.update(insp_to_splat.DEFAULT_IMAGEMAGICK_GUI_SETTINGS)
     if SETTINGS_PATH.exists():
         try:
             with SETTINGS_PATH.open("r", encoding="utf-8") as handle:
                 loaded = json.load(handle)
             if isinstance(loaded, dict):
                 defaults.update(loaded)
+                defaults.update(insp_to_splat.parse_imagemagick_gui_settings(loaded))
         except Exception:
             pass
+    detected_magick = insp_to_splat.find_imagemagick_executable(defaults.get("imagemagick_path", ""))
+    if detected_magick is not None:
+        defaults["imagemagick_path"] = str(detected_magick)
     return defaults
 
 
@@ -120,7 +126,7 @@ class QueueLogHandler(logging.Handler):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, initial_input_paths: list[Path] | None = None):
         super().__init__()
         self.title("SHARP_360_to_Splat")
         self.configure(bg=BG)
@@ -137,6 +143,8 @@ class App(tk.Tk):
         self._scroll_canvas: tk.Canvas | None = None
         self._advanced_scroll_canvas: tk.Canvas | None = None
         self._log_link_index = 0
+        self._suspend_input_sync = False
+        self._initial_input_paths = [path for path in (initial_input_paths or []) if path.exists()]
 
         self.browse_folder_var = tk.StringVar(value=settings["last_browse_folder"])
         self.input_var = tk.StringVar(value=settings["input_path"])
@@ -150,10 +158,18 @@ class App(tk.Tk):
         self.intermediate_dir_var = tk.StringVar(value=settings["intermediate_dir"])
         self.enable_da360_alignment_var = tk.BooleanVar(value=bool(settings["enable_da360_alignment"]))
         self.keep_intermediates_var = tk.BooleanVar(value=bool(settings["keep_intermediates"]))
+        self.delete_temp_files_var = tk.BooleanVar(value=bool(settings["delete_temp_files"]))
         self.enable_seedvr2_upscale_var = tk.BooleanVar(value=bool(settings["enable_seedvr2_upscale"]))
         self.enable_imagemagick_optimization_var = tk.BooleanVar(value=bool(settings["enable_imagemagick_optimization"]))
         self.imagemagick_path_var = tk.StringVar(value=settings["imagemagick_path"])
-        self.imagemagick_commands_var = tk.StringVar(value=settings["imagemagick_commands"])
+        self.imagemagick_auto_level_var = tk.BooleanVar(value=bool(settings["imagemagick_auto_level"]))
+        self.imagemagick_auto_gamma_var = tk.BooleanVar(value=bool(settings["imagemagick_auto_gamma"]))
+        self.imagemagick_normalize_var = tk.BooleanVar(value=bool(settings["imagemagick_normalize"]))
+        self.imagemagick_enhance_var = tk.BooleanVar(value=bool(settings["imagemagick_enhance"]))
+        self.imagemagick_despeckle_var = tk.BooleanVar(value=bool(settings["imagemagick_despeckle"]))
+        self.imagemagick_unsharp_enabled_var = tk.BooleanVar(value=bool(settings["imagemagick_unsharp_enabled"]))
+        self.imagemagick_unsharp_value_var = tk.StringVar(value=str(settings["imagemagick_unsharp_value"]))
+        self.imagemagick_extra_args_var = tk.StringVar(value=str(settings["imagemagick_extra_args"]))
         self.seedvr2_model_name_var = tk.StringVar(value=settings["seedvr2_model_name"])
         self.seedvr2_output_format_var = tk.StringVar(value=settings["seedvr2_output_format"])
         self.seedvr2_color_correction_var = tk.StringVar(value=settings["seedvr2_color_correction"])
@@ -188,10 +204,20 @@ class App(tk.Tk):
         self._build_styles()
         self._build_ui()
         self._bind_persistence()
+        self._auto_detect_imagemagick_path()
+        self._sync_temp_cleanup_state()
         self._sync_output_extension()
-        self._refresh_file_list(select_path=self.input_var.get().strip())
+        initial_select_path = self.input_var.get().strip()
+        if self._initial_input_paths:
+            first_path = self._initial_input_paths[0]
+            self.browse_folder_var.set(str(first_path.parent))
+            initial_select_path = str(first_path)
+        self._refresh_file_list(select_path=initial_select_path)
+        if self._initial_input_paths:
+            self._select_file_paths(self._initial_input_paths)
         self._update_preview()
         self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.bind_all("<Control-a>", self._select_all_files, add="+")
         self.after(100, self._drain_logs)
 
     def _build_styles(self) -> None:
@@ -324,6 +350,8 @@ class App(tk.Tk):
             fg=FG,
             selectbackground=ACCENT_DIM,
             selectforeground=FG,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
             activestyle="none",
             relief="flat",
             borderwidth=0,
@@ -372,6 +400,19 @@ class App(tk.Tk):
         )
         self.keep_check.grid(row=9, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
+        self.delete_temp_check = tk.Checkbutton(
+            form_panel,
+            text="Delete Temp workspace automatically after processing",
+            variable=self.delete_temp_files_var,
+            bg=BG2,
+            fg=FG,
+            activebackground=BG2,
+            activeforeground=FG,
+            selectcolor=BG3,
+            highlightthickness=0,
+        )
+        self.delete_temp_check.grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         self.da360_check = tk.Checkbutton(
             form_panel,
             text="Align SHARP depth scale to DA360 panorama depth",
@@ -383,7 +424,7 @@ class App(tk.Tk):
             selectcolor=BG3,
             highlightthickness=0,
         )
-        self.da360_check.grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.da360_check.grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         self.seedvr2_check = tk.Checkbutton(
             form_panel,
@@ -396,7 +437,7 @@ class App(tk.Tk):
             selectcolor=BG3,
             highlightthickness=0,
         )
-        self.seedvr2_check.grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.seedvr2_check.grid(row=12, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         action_bar = ttk.Frame(container)
         action_bar.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -438,10 +479,17 @@ class App(tk.Tk):
         ttk.Label(parent, text="ImageMagick", style="PanelTitle.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(18, 10))
         self._check_row(parent, 6, "Optimize panorama with ImageMagick before slicing", self.enable_imagemagick_optimization_var)
         self._browse_row(parent, 7, "magick.exe", self.imagemagick_path_var, self._browse_imagemagick)
-        self._entry_row(parent, 8, "Commands", self.imagemagick_commands_var, "Applied in order before slicing")
+        self._check_row(parent, 8, "Auto level", self.imagemagick_auto_level_var)
+        self._check_row(parent, 9, "Auto gamma", self.imagemagick_auto_gamma_var)
+        self._check_row(parent, 10, "Normalize", self.imagemagick_normalize_var)
+        self._check_row(parent, 11, "Enhance", self.imagemagick_enhance_var)
+        self._check_row(parent, 12, "Despeckle", self.imagemagick_despeckle_var)
+        self._check_row(parent, 13, "Apply unsharp mask", self.imagemagick_unsharp_enabled_var)
+        self._entry_row(parent, 14, "Unsharp values", self.imagemagick_unsharp_value_var, "Example: 0x1.2+0.8+0.02")
+        self._entry_row(parent, 15, "Extra args", self.imagemagick_extra_args_var, "Optional extra ImageMagick arguments")
 
-        ttk.Label(parent, text="SeedVR2", style="PanelTitle.TLabel").grid(row=9, column=0, columnspan=3, sticky="w", pady=(18, 10))
-        self._combo_row(parent, 10, "Model", self.seedvr2_model_name_var, [
+        ttk.Label(parent, text="SeedVR2", style="PanelTitle.TLabel").grid(row=16, column=0, columnspan=3, sticky="w", pady=(18, 10))
+        self._combo_row(parent, 17, "Model", self.seedvr2_model_name_var, [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             "seedvr2_ema_3b_fp16.safetensors",
             "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
@@ -453,31 +501,31 @@ class App(tk.Tk):
             "seedvr2_ema_7b-Q4_K_M.gguf",
             "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
         ])
-        self._combo_row(parent, 11, "Output format", self.seedvr2_output_format_var, ["png"])
-        self._combo_row(parent, 12, "Color correction", self.seedvr2_color_correction_var, ["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
-        self._combo_row(parent, 13, "Attention mode", self.seedvr2_attention_mode_var, ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"])
-        self._entry_row(parent, 14, "Resolution factor", self.seedvr2_resolution_factor_var, "Multiplier for extracted face size")
-        self._entry_row(parent, 15, "Max resolution", self.seedvr2_max_resolution_var, "0 disables the cap")
-        self._entry_row(parent, 16, "Batch size", self.seedvr2_batch_size_var, "SeedVR2 image batch size")
-        self._entry_row(parent, 17, "Seed", self.seedvr2_seed_var)
-        self._entry_row(parent, 18, "CUDA device", self.seedvr2_cuda_device_var, "Single GPU id or comma-separated list")
-        self._combo_row(parent, 19, "DiT offload", self.seedvr2_dit_offload_device_var, ["none", "cpu"])
-        self._combo_row(parent, 20, "VAE offload", self.seedvr2_vae_offload_device_var, ["none", "cpu"])
-        self._combo_row(parent, 21, "Tensor offload", self.seedvr2_tensor_offload_device_var, ["none", "cpu"])
-        self._entry_row(parent, 22, "Blocks to swap", self.seedvr2_blocks_to_swap_var, "0-36 depending on model")
-        self._entry_row(parent, 23, "Skip first frames", self.seedvr2_skip_first_frames_var)
-        self._entry_row(parent, 24, "VAE encode tile size", self.seedvr2_vae_encode_tile_size_var)
-        self._entry_row(parent, 25, "VAE encode overlap", self.seedvr2_vae_encode_tile_overlap_var)
-        self._entry_row(parent, 26, "VAE decode tile size", self.seedvr2_vae_decode_tile_size_var)
-        self._entry_row(parent, 27, "VAE decode overlap", self.seedvr2_vae_decode_tile_overlap_var)
-        self._combo_row(parent, 28, "Compile backend", self.seedvr2_compile_backend_var, ["inductor", "cudagraphs"])
-        self._combo_row(parent, 29, "Compile mode", self.seedvr2_compile_mode_var, ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
-        self._check_row(parent, 30, "Swap IO components", self.seedvr2_swap_io_components_var)
-        self._check_row(parent, 31, "Enable VAE encode tiling", self.seedvr2_vae_encode_tiled_var)
-        self._check_row(parent, 32, "Enable VAE decode tiling", self.seedvr2_vae_decode_tiled_var)
-        self._check_row(parent, 33, "Cache DiT model", self.seedvr2_cache_dit_var)
-        self._check_row(parent, 34, "Cache VAE model", self.seedvr2_cache_vae_var)
-        self._check_row(parent, 35, "Enable SeedVR2 debug logging", self.seedvr2_debug_enabled_var)
+        self._combo_row(parent, 18, "Output format", self.seedvr2_output_format_var, ["png"])
+        self._combo_row(parent, 19, "Color correction", self.seedvr2_color_correction_var, ["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
+        self._combo_row(parent, 20, "Attention mode", self.seedvr2_attention_mode_var, ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"])
+        self._entry_row(parent, 21, "Resolution factor", self.seedvr2_resolution_factor_var, "Multiplier for extracted face size")
+        self._entry_row(parent, 22, "Max resolution", self.seedvr2_max_resolution_var, "0 disables the cap")
+        self._entry_row(parent, 23, "Batch size", self.seedvr2_batch_size_var, "SeedVR2 image batch size")
+        self._entry_row(parent, 24, "Seed", self.seedvr2_seed_var)
+        self._entry_row(parent, 25, "CUDA device", self.seedvr2_cuda_device_var, "Single GPU id or comma-separated list")
+        self._combo_row(parent, 26, "DiT offload", self.seedvr2_dit_offload_device_var, ["none", "cpu"])
+        self._combo_row(parent, 27, "VAE offload", self.seedvr2_vae_offload_device_var, ["none", "cpu"])
+        self._combo_row(parent, 28, "Tensor offload", self.seedvr2_tensor_offload_device_var, ["none", "cpu"])
+        self._entry_row(parent, 29, "Blocks to swap", self.seedvr2_blocks_to_swap_var, "0-36 depending on model")
+        self._entry_row(parent, 30, "Skip first frames", self.seedvr2_skip_first_frames_var)
+        self._entry_row(parent, 31, "VAE encode tile size", self.seedvr2_vae_encode_tile_size_var)
+        self._entry_row(parent, 32, "VAE encode overlap", self.seedvr2_vae_encode_tile_overlap_var)
+        self._entry_row(parent, 33, "VAE decode tile size", self.seedvr2_vae_decode_tile_size_var)
+        self._entry_row(parent, 34, "VAE decode overlap", self.seedvr2_vae_decode_tile_overlap_var)
+        self._combo_row(parent, 35, "Compile backend", self.seedvr2_compile_backend_var, ["inductor", "cudagraphs"])
+        self._combo_row(parent, 36, "Compile mode", self.seedvr2_compile_mode_var, ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
+        self._check_row(parent, 37, "Swap IO components", self.seedvr2_swap_io_components_var)
+        self._check_row(parent, 38, "Enable VAE encode tiling", self.seedvr2_vae_encode_tiled_var)
+        self._check_row(parent, 39, "Enable VAE decode tiling", self.seedvr2_vae_decode_tiled_var)
+        self._check_row(parent, 40, "Cache DiT model", self.seedvr2_cache_dit_var)
+        self._check_row(parent, 41, "Cache VAE model", self.seedvr2_cache_vae_var)
+        self._check_row(parent, 42, "Enable SeedVR2 debug logging", self.seedvr2_debug_enabled_var)
 
         notes = (
             "Browse a source folder and select the stitched 2:1 equirect panorama from the list.\n"
@@ -485,11 +533,11 @@ class App(tk.Tk):
             "Working files default to Source/Temp/<image-name>.\n"
             "Compressed formats .spx, .spz, and .sog need gsbox.exe.\n"
             "DA360 gives a panorama-wide depth reference used to normalize SHARP's per-view scale.\n"
-            "ImageMagick can optimize noisy or slightly blurred panoramas before slicing.\n"
+            "ImageMagick can optimize noisy or slightly blurred panoramas before slicing, and the GUI now detects magick.exe automatically.\n"
             "SeedVR2 options are now stored in the main GUI settings file and override the legacy seedvr2_settings.json file."
         )
         notes_label = tk.Label(parent, text=notes, justify="left", bg=BG2, fg=FG_DIM, wraplength=420)
-        notes_label.grid(row=36, column=0, columnspan=3, sticky="ew", pady=(18, 0))
+        notes_label.grid(row=43, column=0, columnspan=3, sticky="ew", pady=(18, 0))
 
     def _on_scrollable_configure(self, _event, canvas_window: int) -> None:
         if self._scroll_canvas is None:
@@ -610,7 +658,8 @@ class App(tk.Tk):
             self.gsbox_var,
             self.intermediate_dir_var,
             self.imagemagick_path_var,
-            self.imagemagick_commands_var,
+            self.imagemagick_unsharp_value_var,
+            self.imagemagick_extra_args_var,
             self.seedvr2_model_name_var,
             self.seedvr2_output_format_var,
             self.seedvr2_color_correction_var,
@@ -636,8 +685,16 @@ class App(tk.Tk):
             variable.trace_add("write", self._on_settings_changed)
         self.enable_da360_alignment_var.trace_add("write", self._on_settings_changed)
         self.keep_intermediates_var.trace_add("write", self._on_settings_changed)
+        self.keep_intermediates_var.trace_add("write", self._on_keep_intermediates_changed)
+        self.delete_temp_files_var.trace_add("write", self._on_settings_changed)
         self.enable_seedvr2_upscale_var.trace_add("write", self._on_settings_changed)
         self.enable_imagemagick_optimization_var.trace_add("write", self._on_settings_changed)
+        self.imagemagick_auto_level_var.trace_add("write", self._on_settings_changed)
+        self.imagemagick_auto_gamma_var.trace_add("write", self._on_settings_changed)
+        self.imagemagick_normalize_var.trace_add("write", self._on_settings_changed)
+        self.imagemagick_enhance_var.trace_add("write", self._on_settings_changed)
+        self.imagemagick_despeckle_var.trace_add("write", self._on_settings_changed)
+        self.imagemagick_unsharp_enabled_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_swap_io_components_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_vae_encode_tiled_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_vae_decode_tiled_var.trace_add("write", self._on_settings_changed)
@@ -648,6 +705,7 @@ class App(tk.Tk):
         self.input_var.trace_add("write", self._on_input_changed)
 
     def _on_settings_changed(self, *_args) -> None:
+        imagemagick_settings = self._build_imagemagick_option_values()
         save_settings(
             {
                 "last_browse_folder": self.browse_folder_var.get().strip(),
@@ -662,10 +720,11 @@ class App(tk.Tk):
                 "intermediate_dir": self.intermediate_dir_var.get().strip(),
                 "enable_da360_alignment": bool(self.enable_da360_alignment_var.get()),
                 "keep_intermediates": bool(self.keep_intermediates_var.get()),
+                "delete_temp_files": bool(self.delete_temp_files_var.get()),
                 "enable_seedvr2_upscale": bool(self.enable_seedvr2_upscale_var.get()),
                 "enable_imagemagick_optimization": bool(self.enable_imagemagick_optimization_var.get()),
                 "imagemagick_path": self.imagemagick_path_var.get().strip(),
-                "imagemagick_commands": self.imagemagick_commands_var.get().strip(),
+                "imagemagick_commands": insp_to_splat.build_imagemagick_command_string(option_values=imagemagick_settings),
                 "seedvr2_model_name": self.seedvr2_model_name_var.get().strip(),
                 "seedvr2_output_format": self.seedvr2_output_format_var.get().strip(),
                 "seedvr2_color_correction": self.seedvr2_color_correction_var.get().strip(),
@@ -692,10 +751,13 @@ class App(tk.Tk):
                 "seedvr2_cache_dit": bool(self.seedvr2_cache_dit_var.get()),
                 "seedvr2_cache_vae": bool(self.seedvr2_cache_vae_var.get()),
                 "seedvr2_debug_enabled": bool(self.seedvr2_debug_enabled_var.get()),
+                **imagemagick_settings,
             }
         )
 
     def _on_input_changed(self, *_args) -> None:
+        if self._suspend_input_sync:
+            return
         input_text = self.input_var.get().strip()
         if input_text:
             input_path = Path(input_text)
@@ -704,6 +766,20 @@ class App(tk.Tk):
         self._suggest_output_path()
         self._sync_file_selection()
         self._update_preview()
+
+    def _on_keep_intermediates_changed(self, *_args) -> None:
+        self._sync_temp_cleanup_state()
+        self._on_settings_changed()
+
+    def _sync_temp_cleanup_state(self) -> None:
+        if getattr(self, "keep_intermediates_var", None) is None or getattr(self, "delete_temp_check", None) is None:
+            return
+        if self.keep_intermediates_var.get():
+            if self.delete_temp_files_var.get():
+                self.delete_temp_files_var.set(False)
+            self.delete_temp_check.configure(state="disabled")
+        else:
+            self.delete_temp_check.configure(state="normal")
 
     def _on_format_changed(self, *_args) -> None:
         self._sync_output_extension()
@@ -739,6 +815,28 @@ class App(tk.Tk):
         if select_path:
             self._sync_file_selection(Path(select_path))
 
+    def _get_selected_paths(self) -> list[Path]:
+        indices = list(self.file_listbox.curselection())
+        return [self._file_paths[index] for index in indices if 0 <= index < len(self._file_paths)]
+
+    def _select_file_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            return
+        wanted = {path.resolve() for path in paths if path.exists()}
+        self.file_listbox.selection_clear(0, tk.END)
+        selected_paths: list[Path] = []
+        for index, path in enumerate(self._file_paths):
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if resolved in wanted:
+                self.file_listbox.selection_set(index)
+                selected_paths.append(path)
+        if selected_paths:
+            self.file_listbox.see(self._file_paths.index(selected_paths[0]))
+            self._set_current_input(selected_paths[0], sync_preview=True)
+
     def _sync_file_selection(self, selected_path: Path | None = None) -> None:
         current = selected_path
         if current is None:
@@ -756,7 +854,19 @@ class App(tk.Tk):
     def _default_temp_dir(self, input_path: Path) -> Path:
         return input_path.parent / "Temp" / input_path.stem
 
+    def _set_current_input(self, path: Path, sync_preview: bool = False) -> None:
+        self._suspend_input_sync = True
+        try:
+            self.input_var.set(str(path))
+            suffix = self.format_var.get().strip() or "ply"
+            self.output_var.set(str(path.with_name(f"{path.stem}_merged.{suffix}")))
+        finally:
+            self._suspend_input_sync = False
+        if sync_preview:
+            self._update_preview()
+
     def _update_preview(self) -> None:
+        selected_paths = self._get_selected_paths()
         input_text = self.input_var.get().strip()
         if not input_text:
             self._preview_photo = None
@@ -766,7 +876,7 @@ class App(tk.Tk):
             self.temp_hint_var.set("Working files will be written under Source/Temp.")
             return
 
-        input_path = Path(input_text)
+        input_path = selected_paths[0] if selected_paths else Path(input_text)
         if not input_path.exists():
             self._preview_photo = None
             self.preview_label.configure(image="", text="Missing file", width=PREVIEW_SIZE[0], height=12)
@@ -793,13 +903,30 @@ class App(tk.Tk):
             self.preview_label.configure(image="", text=f"Preview unavailable\n{exc}", width=PREVIEW_SIZE[0], height=12)
 
         temp_dir = Path(self.intermediate_dir_var.get().strip()) if self.intermediate_dir_var.get().strip() else self._default_temp_dir(input_path)
-        self.selection_var.set(
-            f"{input_path.name}\n"
-            f"Resolution: {dimensions[0]} x {dimensions[1]}\n"
-            f"Detected files in folder: {len(self._file_paths)}"
-        )
-        self.output_hint_var.set(f"Final output: {self.output_var.get().strip()}")
-        self.temp_hint_var.set(f"Temp workspace: {temp_dir}")
+        if len(selected_paths) > 1:
+            self.selection_var.set(
+                f"{len(selected_paths)} files selected\n"
+                f"First: {input_path.name}\n"
+                f"Detected files in folder: {len(self._file_paths)}"
+            )
+            self.output_hint_var.set(f"Batch output pattern: <source>_merged.{self.format_var.get().strip() or 'ply'} beside each source image")
+            if self.intermediate_dir_var.get().strip():
+                self.temp_hint_var.set(f"Temp workspaces: {self.intermediate_dir_var.get().strip()}\\<image-name>")
+            elif self.delete_temp_files_var.get():
+                self.temp_hint_var.set("Temp workspaces will be deleted automatically after each file.")
+            else:
+                self.temp_hint_var.set("Temp workspaces will be kept under Source/Temp for each selected image.")
+        else:
+            self.selection_var.set(
+                f"{input_path.name}\n"
+                f"Resolution: {dimensions[0]} x {dimensions[1]}\n"
+                f"Detected files in folder: {len(self._file_paths)}"
+            )
+            self.output_hint_var.set(f"Final output: {self.output_var.get().strip()}")
+            if self.delete_temp_files_var.get() and not self.keep_intermediates_var.get():
+                self.temp_hint_var.set(f"Temp workspace: {temp_dir} (will be deleted after processing)")
+            else:
+                self.temp_hint_var.set(f"Temp workspace: {temp_dir}")
 
     def _browse_input(self) -> None:
         path = filedialog.askopenfilename(
@@ -838,6 +965,27 @@ class App(tk.Tk):
         if path:
             self.imagemagick_path_var.set(path)
 
+    def _auto_detect_imagemagick_path(self) -> None:
+        current_value = self.imagemagick_path_var.get().strip()
+        detected = insp_to_splat.find_imagemagick_executable(current_value)
+        if detected is None:
+            return
+        detected_text = str(detected)
+        if current_value != detected_text:
+            self.imagemagick_path_var.set(detected_text)
+
+    def _build_imagemagick_option_values(self) -> dict[str, object]:
+        return {
+            "imagemagick_auto_level": bool(self.imagemagick_auto_level_var.get()),
+            "imagemagick_auto_gamma": bool(self.imagemagick_auto_gamma_var.get()),
+            "imagemagick_normalize": bool(self.imagemagick_normalize_var.get()),
+            "imagemagick_enhance": bool(self.imagemagick_enhance_var.get()),
+            "imagemagick_despeckle": bool(self.imagemagick_despeckle_var.get()),
+            "imagemagick_unsharp_enabled": bool(self.imagemagick_unsharp_enabled_var.get()),
+            "imagemagick_unsharp_value": self.imagemagick_unsharp_value_var.get().strip(),
+            "imagemagick_extra_args": self.imagemagick_extra_args_var.get().strip(),
+        }
+
     def _browse_da360_checkpoint(self) -> None:
         path = filedialog.askopenfilename(
             title="Select DA360 checkpoint",
@@ -858,12 +1006,21 @@ class App(tk.Tk):
             self._update_preview()
 
     def _on_browser_select(self, _event=None) -> None:
-        selection = self.file_listbox.curselection()
-        if not selection:
+        selected_paths = self._get_selected_paths()
+        if not selected_paths:
             return
-        selected = self._file_paths[selection[0]]
+        selected = selected_paths[0]
         if self.input_var.get().strip() != str(selected):
-            self.input_var.set(str(selected))
+            self._set_current_input(selected)
+        self._update_preview()
+
+    def _select_all_files(self, event=None):
+        widget = self.focus_get()
+        if widget is not self.file_listbox:
+            return None
+        self.file_listbox.selection_set(0, tk.END)
+        self._on_browser_select()
+        return "break"
 
     def _append_log(self, level: str, message: str) -> None:
         self.log_text.config(state="normal")
@@ -958,14 +1115,15 @@ class App(tk.Tk):
             self._append_log(level, message)
         self.after(100, self._drain_logs)
 
-    def _validate_inputs(self) -> bool:
+    def _validate_inputs(self, input_paths: list[Path]) -> bool:
         if self._running:
             return False
-        if not self.input_var.get().strip():
+        if not input_paths:
             messagebox.showerror("Missing input", "Select a 2:1 equirect panorama file.")
             return False
-        if not Path(self.input_var.get().strip()).exists():
-            messagebox.showerror("Missing input", "The selected input file does not exist.")
+        missing_paths = [path for path in input_paths if not path.exists()]
+        if missing_paths:
+            messagebox.showerror("Missing input", f"The selected input file does not exist:\n{missing_paths[0]}")
             return False
         try:
             if self.side_count_var.get().strip():
@@ -988,23 +1146,34 @@ class App(tk.Tk):
             if magick_path is None:
                 messagebox.showerror("ImageMagick required", "Panorama optimization is enabled, but magick.exe was not found. Pick it in the GUI or add ImageMagick to PATH.")
                 return False
-            if not self.imagemagick_commands_var.get().strip():
-                messagebox.showerror("ImageMagick commands required", "Provide ImageMagick commands or disable panorama optimization.")
+            imagemagick_commands = insp_to_splat.build_imagemagick_command_tokens(option_values=self._build_imagemagick_option_values())
+            if not imagemagick_commands:
+                messagebox.showerror("ImageMagick commands required", "Enable at least one ImageMagick operation or disable panorama optimization.")
+                return False
+            if self.imagemagick_unsharp_enabled_var.get() and not self.imagemagick_unsharp_value_var.get().strip():
+                messagebox.showerror("ImageMagick unsharp required", "Provide unsharp values or disable the unsharp option.")
                 return False
         if self.format_var.get().strip() in {"spx", "spz", "sog"} and not self.gsbox_var.get().strip() and not (ROOT_DIR / "gsbox.exe").exists():
             messagebox.showerror("gsbox required", "Compressed output needs gsbox.exe. Pick it in the GUI or place it next to this script.")
             return False
         return True
 
-    def _build_args(self) -> SimpleNamespace:
+    def _build_args_for_input(self, input_path: Path, batch_mode: bool = False) -> SimpleNamespace:
         side_count_text = self.side_count_var.get().strip()
         checkpoint_text = self.checkpoint_var.get().strip()
         da360_checkpoint_text = self.da360_checkpoint_var.get().strip()
         gsbox_text = self.gsbox_var.get().strip()
         intermediate_dir_text = self.intermediate_dir_var.get().strip()
+        imagemagick_settings = self._build_imagemagick_option_values()
+        suffix = self.format_var.get().strip() or "ply"
+        output_path = input_path.with_name(f"{input_path.stem}_merged.{suffix}") if batch_mode else Path(self.output_var.get().strip())
+        intermediate_dir = None
+        if intermediate_dir_text:
+            intermediate_root = Path(intermediate_dir_text)
+            intermediate_dir = (intermediate_root / input_path.stem) if batch_mode else intermediate_root
         return SimpleNamespace(
-            input=Path(self.input_var.get().strip()),
-            output=Path(self.output_var.get().strip()),
+            input=input_path,
+            output=output_path,
             side_count=int(side_count_text) if side_count_text else 4,
             face_size=0,
             format=self.format_var.get().strip(),
@@ -1015,28 +1184,37 @@ class App(tk.Tk):
             da360_checkpoint=Path(da360_checkpoint_text) if da360_checkpoint_text else None,
             enable_da360_alignment=bool(self.enable_da360_alignment_var.get()),
             keep_intermediates=bool(self.keep_intermediates_var.get()),
+            delete_temp_files=bool(self.delete_temp_files_var.get()),
             enable_seedvr2_upscale=bool(self.enable_seedvr2_upscale_var.get()),
             enable_imagemagick_optimization=bool(self.enable_imagemagick_optimization_var.get()),
             imagemagick=Path(self.imagemagick_path_var.get().strip()) if self.imagemagick_path_var.get().strip() else None,
-            imagemagick_commands=self.imagemagick_commands_var.get().strip(),
-            intermediate_dir=Path(intermediate_dir_text) if intermediate_dir_text else None,
+            imagemagick_commands=insp_to_splat.build_imagemagick_command_string(option_values=imagemagick_settings),
+            intermediate_dir=intermediate_dir,
             config=insp_to_splat.DEFAULT_CONFIG_PATH,
             gsbox=Path(gsbox_text) if gsbox_text else None,
             verbose=True,
+            **imagemagick_settings,
         )
 
     def _start_pipeline(self) -> None:
-        if not self._validate_inputs():
+        selected_paths = self._get_selected_paths()
+        if not selected_paths and self.input_var.get().strip():
+            selected_paths = [Path(self.input_var.get().strip())]
+        if not self._validate_inputs(selected_paths):
             return
         self._running = True
-        self.status_var.set("Running pipeline...")
+        batch_count = len(selected_paths)
+        self.status_var.set(f"Running pipeline for {batch_count} image{'s' if batch_count != 1 else ''}...")
         self.progress.start(10)
-        self._append_log("info", f"Starting 360 SHARP pipeline for {Path(self.input_var.get().strip()).name}.")
-        args = self._build_args()
-        self._worker = threading.Thread(target=self._run_pipeline_worker, args=(args,), daemon=True)
+        if batch_count == 1:
+            self._append_log("info", f"Starting 360 SHARP pipeline for {selected_paths[0].name}.")
+        else:
+            self._append_log("info", f"Starting batch pipeline for {batch_count} panoramas.")
+        args_list = [self._build_args_for_input(path, batch_mode=batch_count > 1) for path in selected_paths]
+        self._worker = threading.Thread(target=self._run_pipeline_worker, args=(args_list,), daemon=True)
         self._worker.start()
 
-    def _run_pipeline_worker(self, args: SimpleNamespace) -> None:
+    def _run_pipeline_worker(self, args_list: list[SimpleNamespace]) -> None:
         logger = logging.getLogger()
         handler = QueueLogHandler(self._log_queue)
         handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
@@ -1044,53 +1222,46 @@ class App(tk.Tk):
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         try:
-            result = insp_to_splat.run_pipeline(args)
+            results = []
+            total = len(args_list)
+            for index, args in enumerate(args_list, start=1):
+                self._log_queue.put(("info", f"[{index}/{total}] Processing {args.input.name}"))
+                result = insp_to_splat.run_pipeline(args)
+                results.append(result)
         except Exception as exc:
             self._log_queue.put(("error", f"Pipeline failed: {exc}"))
             self.after(0, lambda: self._finish_pipeline(False, None))
         else:
-            self._log_queue.put(("info", f"Finished successfully: {result.output_path}"))
-            self.after(0, lambda r=result: self._finish_pipeline(True, r))
+            for result in results:
+                self._log_queue.put(("info", f"Finished successfully: {result.output_path}"))
+            self.after(0, lambda r=results: self._finish_pipeline(True, r))
         finally:
             logger.removeHandler(handler)
             logger.setLevel(previous_level)
 
-    def _finish_pipeline(self, success: bool, result=None) -> None:
+    def _finish_pipeline(self, success: bool, results: list | None = None) -> None:
         self._running = False
         self.progress.stop()
-        if success and result is not None:
-            self.status_var.set(f"Done: {result.output_path.name}")
-            self.output_var.set(str(result.output_path))
+        if success and results:
+            last_result = results[-1]
+            if len(results) == 1:
+                self.status_var.set(f"Done: {last_result.output_path.name}")
+            else:
+                self.status_var.set(f"Done: {len(results)} files processed")
+            self.output_var.set(str(last_result.output_path))
             self._update_preview()
-            self._show_completion_popup(result.output_path)
-            if result.depth_map_path and result.depth_map_path.exists():
-                self._show_depth_map(result.depth_map_path)
+            if len(results) == 1:
+                self._show_completion_popup(last_result.output_path)
+            else:
+                messagebox.showinfo("Batch complete", f"Processed {len(results)} panoramas successfully.\nSee the log for clickable output paths.")
         else:
             self.status_var.set("Pipeline failed")
             messagebox.showerror("Pipeline failed", "The pipeline did not finish. Check the log for details.")
 
-    def _show_depth_map(self, depth_map_path: Path) -> None:
-        try:
-            img = Image.open(depth_map_path)
-        except Exception:
-            return
-        max_w, max_h = 1000, 500
-        w, h = img.size
-        scale = min(max_w / w, max_h / h, 1.0)
-        if scale < 1.0:
-            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-        win = tk.Toplevel(self)
-        win.title("DA360 Depth Map")
-        win.configure(bg=BG)
-        photo = ImageTk.PhotoImage(img)
-        label = tk.Label(win, image=photo, bg=BG)
-        label.image = photo  # prevent garbage collection
-        label.pack(padx=10, pady=10)
-        tk.Label(win, text=str(depth_map_path), bg=BG, fg=FG_DIM, font=("Consolas", 9)).pack(pady=(0, 10))
-
 
 def main() -> int:
-    app = App()
+    initial_input_paths = [Path(arg).resolve() for arg in sys.argv[1:] if Path(arg).exists()]
+    app = App(initial_input_paths=initial_input_paths)
     app.mainloop()
     return 0
 

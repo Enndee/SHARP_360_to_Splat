@@ -99,6 +99,15 @@ copy /Y "gsbox.exe" "%PACKAGE_DIR%\" >nul
 if not exist "%PACKAGE_DIR%\third_party\DA360" mkdir "%PACKAGE_DIR%\third_party\DA360"
 xcopy /E /I /Y "third_party\DA360\*" "%PACKAGE_DIR%\third_party\DA360\" >nul
 
+if exist "third_party\ImageMagick\magick.exe" (
+    if not exist "%PACKAGE_DIR%\third_party\ImageMagick" mkdir "%PACKAGE_DIR%\third_party\ImageMagick"
+    xcopy /E /I /Y "third_party\ImageMagick\*" "%PACKAGE_DIR%\third_party\ImageMagick\" >nul
+    echo       Included repo-managed ImageMagick from third_party\ImageMagick.
+) else (
+    echo       ImageMagick was not found under third_party\ImageMagick.
+    echo       The release package will rely on Setup_NewPC.bat to install it on the target machine.
+)
+
 if exist "checkpoints\DA360_large.pth" (
     if not exist "%PACKAGE_DIR%\checkpoints" mkdir "%PACKAGE_DIR%\checkpoints"
     copy /Y "checkpoints\DA360_large.pth" "%PACKAGE_DIR%\checkpoints\" >nul
@@ -135,6 +144,7 @@ if exist "easy_360_sharp_gui_settings.json" del /Q "%PACKAGE_DIR%\easy_360_sharp
     echo   - Right-click any JPEG/PNG -^> Send To -^> SHARP_360_to_Splat
     echo     ^(Setup_NewPC.bat creates the Send To shortcut automatically^)
     echo   - DA360 depth alignment is enabled by default when checkpoints\DA360_large.pth is present
+    echo   - If third_party\ImageMagick\ is bundled, the GUI uses that local copy first
     echo   - Double-click splat files in the GUI to open them in the configured viewer
     echo.
     echo FOLDER STRUCTURE
@@ -143,6 +153,7 @@ if exist "easy_360_sharp_gui_settings.json" del /Q "%PACKAGE_DIR%\easy_360_sharp
     echo   !Launch_SHARP_360_to_Splat.bat - script launcher
     echo   Setup_NewPC.bat           - one-time environment installer
     echo   third_party\DA360\       - vendored DA360 inference code
+    echo   third_party\ImageMagick\ - optional bundled ImageMagick runtime
     echo   checkpoints\DA360_large.pth - default DA360 checkpoint
 ) > "%PACKAGE_DIR%\README.txt"
 
@@ -150,6 +161,10 @@ if exist "%PACKAGE_DIR%\splatapult\build\Release" (
     >> "%PACKAGE_DIR%\README.txt" echo   splatapult\build\Release\ - bundled viewer files
 ) else (
     >> "%PACKAGE_DIR%\README.txt" echo   Viewer payload not bundled in this package.
+)
+
+if not exist "%PACKAGE_DIR%\third_party\ImageMagick\magick.exe" (
+    >> "%PACKAGE_DIR%\README.txt" echo   ImageMagick not bundled; Setup_NewPC.bat will install it into third_party\ImageMagick on the target PC.
 )
 
 echo.

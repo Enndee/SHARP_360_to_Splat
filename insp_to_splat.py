@@ -10,7 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ def resolve_resource_path(*parts: str) -> Path:
 ROOT_DIR = APP_DIR
 LOCAL_SHARP_SRC = SOURCE_DIR / "ml-sharp" / "src"
 LOCAL_DA360_ROOT = resolve_resource_path("third_party", "DA360")
+LOCAL_IMAGEMAGICK_ROOT = APP_DIR / "third_party" / "ImageMagick"
 DEFAULT_CONFIG_PATH = resolve_resource_path("insp_settings.json")
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
 DEFAULT_DA360_CHECKPOINT_PATH = resolve_resource_path("checkpoints", "DA360_large.pth")
@@ -45,6 +46,23 @@ GUI_SETTINGS_PATH = resolve_resource_path("easy_360_sharp_gui_settings.json")
 SEEDVR2_SETTINGS_PATH = resolve_resource_path("seedvr2_settings.json")
 SEEDVR2_CLI_PATH = resolve_resource_path("seedvr2_videoupscaler", "inference_cli.py")
 DEFAULT_IMAGEMAGICK_COMMANDS = "-auto-level -auto-gamma -normalize -enhance -despeckle -unsharp 0x1.2+0.8+0.02"
+IMAGEMAGICK_OPTION_FLAGS = (
+    ("imagemagick_auto_level", "-auto-level"),
+    ("imagemagick_auto_gamma", "-auto-gamma"),
+    ("imagemagick_normalize", "-normalize"),
+    ("imagemagick_enhance", "-enhance"),
+    ("imagemagick_despeckle", "-despeckle"),
+)
+DEFAULT_IMAGEMAGICK_GUI_SETTINGS = {
+    "imagemagick_auto_level": True,
+    "imagemagick_auto_gamma": True,
+    "imagemagick_normalize": True,
+    "imagemagick_enhance": True,
+    "imagemagick_despeckle": True,
+    "imagemagick_unsharp_enabled": True,
+    "imagemagick_unsharp_value": "0x1.2+0.8+0.02",
+    "imagemagick_extra_args": "",
+}
 SUPPORTED_INPUT_SUFFIXES = {".jpg", ".jpeg", ".png", ".heic"}
 COMPRESSED_OUTPUT_SUFFIXES = {".spx", ".spz", ".sog"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -173,6 +191,11 @@ def parse_args() -> argparse.Namespace:
         help="Keep extracted face images and per-face PLY files next to the output.",
     )
     parser.add_argument(
+        "--delete-temp-files",
+        action="store_true",
+        help="Delete the Temp workspace after processing finishes successfully.",
+    )
+    parser.add_argument(
         "--intermediate-dir",
         type=Path,
         default=None,
@@ -270,6 +293,121 @@ def load_seedvr2_settings() -> dict:
     return settings
 
 
+def parse_imagemagick_gui_settings(raw_settings: Mapping[str, Any] | None) -> dict[str, Any]:
+    settings = dict(DEFAULT_IMAGEMAGICK_GUI_SETTINGS)
+    if not raw_settings:
+        return settings
+
+    structured_keys = set(DEFAULT_IMAGEMAGICK_GUI_SETTINGS)
+    has_structured_values = any(key in raw_settings for key in structured_keys)
+    for key in structured_keys:
+        if key in raw_settings:
+            settings[key] = raw_settings[key]
+
+    legacy_commands = str(raw_settings.get("imagemagick_commands", "") or "").strip()
+    if not legacy_commands or has_structured_values:
+        return settings
+
+    tokens = shlex.split(legacy_commands)
+    extras: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        matched_flag = False
+        for key, flag in IMAGEMAGICK_OPTION_FLAGS:
+            if token == flag:
+                settings[key] = True
+                matched_flag = True
+                break
+        if matched_flag:
+            index += 1
+            continue
+        if token == "-unsharp":
+            settings["imagemagick_unsharp_enabled"] = True
+            if index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+                settings["imagemagick_unsharp_value"] = tokens[index + 1]
+                index += 2
+            else:
+                index += 1
+            continue
+        extras.append(token)
+        index += 1
+
+    settings["imagemagick_extra_args"] = shlex.join(extras) if extras else ""
+    return settings
+
+
+def build_imagemagick_command_tokens(
+    command_string: str | None = None,
+    option_values: Mapping[str, Any] | None = None,
+) -> list[str]:
+    if option_values is not None:
+        settings = parse_imagemagick_gui_settings(option_values)
+        tokens: list[str] = []
+        for key, flag in IMAGEMAGICK_OPTION_FLAGS:
+            if bool(settings.get(key)):
+                tokens.append(flag)
+        if bool(settings.get("imagemagick_unsharp_enabled")):
+            tokens.append("-unsharp")
+            unsharp_value = str(settings.get("imagemagick_unsharp_value", "") or "").strip()
+            if unsharp_value:
+                tokens.append(unsharp_value)
+        extra_args = str(settings.get("imagemagick_extra_args", "") or "").strip()
+        if extra_args:
+            tokens.extend(shlex.split(extra_args))
+        return tokens
+
+    resolved_string = (command_string or DEFAULT_IMAGEMAGICK_COMMANDS).strip() or DEFAULT_IMAGEMAGICK_COMMANDS
+    return shlex.split(resolved_string)
+
+
+def build_imagemagick_command_string(
+    command_string: str | None = None,
+    option_values: Mapping[str, Any] | None = None,
+) -> str:
+    tokens = build_imagemagick_command_tokens(command_string=command_string, option_values=option_values)
+    return shlex.join(tokens) if tokens else ""
+
+
+def resolve_imagemagick_command_tokens(args: argparse.Namespace | Any) -> list[str]:
+    option_values = {key: getattr(args, key) for key in DEFAULT_IMAGEMAGICK_GUI_SETTINGS if hasattr(args, key)}
+    if option_values:
+        return build_imagemagick_command_tokens(option_values=option_values)
+    return build_imagemagick_command_tokens(command_string=getattr(args, "imagemagick_commands", None))
+
+
+def _iter_imagemagick_install_candidates() -> Iterable[Path]:
+    local_candidates = [
+        LOCAL_IMAGEMAGICK_ROOT / "magick.exe",
+        LOCAL_IMAGEMAGICK_ROOT / "bin" / "magick.exe",
+    ]
+    for candidate in local_candidates:
+        if candidate.exists():
+            yield candidate
+
+    env_roots = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles(x86)"),
+    ]
+    local_app_data = os.environ.get("LocalAppData")
+    if local_app_data:
+        env_roots.append(str(Path(local_app_data) / "Programs"))
+
+    seen: set[Path] = set()
+    for root in env_roots:
+        if not root:
+            continue
+        root_path = Path(root)
+        if not root_path.exists():
+            continue
+        for install_dir in sorted(root_path.glob("ImageMagick-*"), reverse=True):
+            candidate = install_dir / "magick.exe"
+            if candidate not in seen:
+                seen.add(candidate)
+                yield candidate
+
+
 def find_imagemagick_executable(path_value: str | Path | None) -> Path | None:
     resolved = resolve_optional_path(path_value)
     if resolved is not None:
@@ -279,6 +417,9 @@ def find_imagemagick_executable(path_value: str | Path | None) -> Path | None:
     magick_on_path = shutil.which("magick")
     if magick_on_path:
         return Path(magick_on_path)
+    for candidate in _iter_imagemagick_install_candidates():
+        if candidate.exists():
+            return candidate
     return None
 
 
@@ -286,7 +427,7 @@ def optimize_panorama_with_imagemagick(
     panorama: np.ndarray,
     temp_root: Path,
     magick_path: Path,
-    command_string: str,
+    command_tokens: Sequence[str],
 ) -> np.ndarray:
     preprocess_dir = temp_root / "preprocess"
     preprocess_dir.mkdir(parents=True, exist_ok=True)
@@ -294,7 +435,7 @@ def optimize_panorama_with_imagemagick(
     output_path = preprocess_dir / "panorama_optimized.png"
     Image.fromarray(panorama).save(input_path)
 
-    command = [str(magick_path), str(input_path), *shlex.split(command_string), str(output_path)]
+    command = [str(magick_path), str(input_path), *command_tokens, str(output_path)]
     LOGGER.info("Running ImageMagick optimization: %s", " ".join(command))
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
@@ -513,7 +654,8 @@ def load_panorama(path: Path) -> np.ndarray:
 
 
 def load_input_panorama(path: Path) -> np.ndarray:
-    return load_panorama(path)
+    panorama = load_panorama(path)
+    return np.ascontiguousarray(panorama[:, ::-1, :])
 
 
 def validate_equirectangular_shape(image: np.ndarray) -> tuple[int, int]:
@@ -1129,6 +1271,17 @@ def choose_temp_root(args: argparse.Namespace) -> Path:
     return args.input.parent / "Temp" / args.input.stem
 
 
+def cleanup_temp_root(args: argparse.Namespace, temp_root: Path) -> None:
+    if not bool(getattr(args, "delete_temp_files", False)):
+        return
+    if bool(getattr(args, "keep_intermediates", False)):
+        return
+    if not temp_root.exists():
+        return
+    shutil.rmtree(temp_root, ignore_errors=True)
+    LOGGER.info("Deleted Temp workspace %s", temp_root)
+
+
 def run_pipeline(args: argparse.Namespace) -> PipelineResult:
     from sharp.cli.predict import predict_image
     from sharp.utils.gaussians import apply_transform, save_ply
@@ -1159,6 +1312,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
     temp_root = choose_temp_root(args)
     register_optional_image_plugins()
     panorama = load_input_panorama(args.input)
+    LOGGER.info("Mirrored panorama horizontally before preprocessing and view extraction.")
     panorama_width, panorama_height = validate_equirectangular_shape(panorama)
     seedvr2_upscale_enabled = getattr(args, "enable_seedvr2_upscale", False)
     imagemagick_optimization_enabled = getattr(args, "enable_imagemagick_optimization", False)
@@ -1167,7 +1321,9 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
         magick_path = find_imagemagick_executable(getattr(args, "imagemagick", None))
         if magick_path is None:
             raise FileNotFoundError("ImageMagick optimization is enabled, but magick.exe was not found. Provide --imagemagick or add ImageMagick to PATH.")
-        imagemagick_commands = getattr(args, "imagemagick_commands", DEFAULT_IMAGEMAGICK_COMMANDS) or DEFAULT_IMAGEMAGICK_COMMANDS
+        imagemagick_commands = resolve_imagemagick_command_tokens(args)
+        if not imagemagick_commands:
+            raise ValueError("ImageMagick optimization is enabled, but no preprocessing operations were selected.")
         LOGGER.info("Optimizing panorama with ImageMagick before slicing.")
         panorama = optimize_panorama_with_imagemagick(panorama, temp_root, magick_path, imagemagick_commands)
         panorama_width, panorama_height = validate_equirectangular_shape(panorama)
@@ -1281,6 +1437,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
     if output_format == "ply":
         LOGGER.info("Saving merged PLY to %s", output_path)
         save_ply(merged, focal_px, (face_size, face_size), output_path)
+        cleanup_temp_root(args, temp_root)
         return PipelineResult(output_path=output_path, depth_map_path=depth_map_path)
 
     gsbox_path = find_gsbox(args.gsbox)
@@ -1294,6 +1451,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
     temp_ply = conversion_dir / f"{output_path.stem}.ply"
     save_ply(merged, focal_px, (face_size, face_size), temp_ply)
     convert_with_gsbox(temp_ply, output_path, output_format, quality, sh_degree, gsbox_path)
+    cleanup_temp_root(args, temp_root)
     return PipelineResult(output_path=output_path, depth_map_path=depth_map_path)
 
 

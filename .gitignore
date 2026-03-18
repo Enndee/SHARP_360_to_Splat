@@ -19,3 +19,5 @@ Example files/*_intermediates/
 models/SEEDVR2/
 seedvr2_videoupscaler/
 .gitattributes
+third_party/ImageMagick/
+third_party/_downloads/
