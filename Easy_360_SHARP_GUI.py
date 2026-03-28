@@ -55,11 +55,17 @@ def load_settings() -> dict:
         "gsbox": "",
         "intermediate_dir": "",
         "enable_da360_alignment": True,
+        "alignment_grid_resolution": 4,
+        "alignment_detail_weight": 0.0,
+        "cutoff_height_percent": 0.0,
+        "enable_alignment_sweep": False,
         "keep_intermediates": False,
         "delete_temp_files": True,
         "enable_seedvr2_upscale": False,
         "enable_imagemagick_optimization": True,
         "imagemagick_path": "",
+        "enable_deblur_preprocessing": False,
+        "deblur_strength": "medium",
         "seedvr2_model_name": str(SEEDVR2_DEFAULTS.get("model_name", "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors")),
         "seedvr2_output_format": str(SEEDVR2_DEFAULTS.get("output_format", "png")),
         "seedvr2_color_correction": str(SEEDVR2_DEFAULTS.get("color_correction", "lab")),
@@ -69,6 +75,9 @@ def load_settings() -> dict:
         "seedvr2_vae_offload_device": str(SEEDVR2_DEFAULTS.get("vae_offload_device", "cpu")),
         "seedvr2_tensor_offload_device": str(SEEDVR2_DEFAULTS.get("tensor_offload_device", "cpu")),
         "seedvr2_resolution_factor": str(SEEDVR2_DEFAULTS.get("resolution_factor", "2")),
+        "seedvr2_stretch_proportions": bool(SEEDVR2_DEFAULTS.get("stretch_proportions", False)),
+        "seedvr2_target_short_side": str(SEEDVR2_DEFAULTS.get("target_short_side", "0")),
+        "seedvr2_min_resolution": str(SEEDVR2_DEFAULTS.get("min_resolution", "0")),
         "seedvr2_max_resolution": str(SEEDVR2_DEFAULTS.get("max_resolution", "0")),
         "seedvr2_batch_size": str(SEEDVR2_DEFAULTS.get("batch_size", "1")),
         "seedvr2_seed": str(SEEDVR2_DEFAULTS.get("seed", "42")),
@@ -88,15 +97,24 @@ def load_settings() -> dict:
         "seedvr2_debug_enabled": bool(SEEDVR2_DEFAULTS.get("debug_enabled", False)),
     }
     defaults.update(insp_to_splat.DEFAULT_IMAGEMAGICK_GUI_SETTINGS)
+    defaults.update(insp_to_splat.DEFAULT_DEBLUR_GUI_SETTINGS)
+    loaded_preset_name = None
     if SETTINGS_PATH.exists():
         try:
             with SETTINGS_PATH.open("r", encoding="utf-8") as handle:
                 loaded = json.load(handle)
             if isinstance(loaded, dict):
+                loaded_preset_name = loaded.get("imagemagick_preset")
                 defaults.update(loaded)
                 defaults.update(insp_to_splat.parse_imagemagick_gui_settings(loaded))
         except Exception:
             pass
+    inferred_preset = insp_to_splat.infer_imagemagick_preset_name(defaults)
+    if loaded_preset_name is None and inferred_preset == "classic":
+        defaults.update(insp_to_splat.get_imagemagick_preset_settings(insp_to_splat.DEFAULT_IMAGEMAGICK_PRESET))
+        defaults["imagemagick_preset"] = insp_to_splat.DEFAULT_IMAGEMAGICK_PRESET
+    else:
+        defaults["imagemagick_preset"] = inferred_preset
     detected_magick = insp_to_splat.find_imagemagick_executable(defaults.get("imagemagick_path", ""))
     if detected_magick is not None:
         defaults["imagemagick_path"] = str(detected_magick)
@@ -125,6 +143,65 @@ class QueueLogHandler(logging.Handler):
             pass
 
 
+class HoverTooltip:
+    def __init__(self, widget, text: str, *, delay_ms: int = 450):
+        self.widget = widget
+        self.text = text.strip()
+        self.delay_ms = delay_ms
+        self._after_id = None
+        self._window: tk.Toplevel | None = None
+        if not self.text:
+            return
+        self.widget.bind("<Enter>", self._on_enter, add="+")
+        self.widget.bind("<Leave>", self._on_leave, add="+")
+        self.widget.bind("<ButtonPress>", self._on_leave, add="+")
+        self.widget.bind("<Destroy>", self._on_leave, add="+")
+
+    def _on_enter(self, _event=None) -> None:
+        self._cancel_scheduled()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _on_leave(self, _event=None) -> None:
+        self._cancel_scheduled()
+        self._hide()
+
+    def _cancel_scheduled(self) -> None:
+        if self._after_id is not None:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._window is not None or not self.widget.winfo_exists():
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+        window = tk.Toplevel(self.widget)
+        window.wm_overrideredirect(True)
+        window.wm_geometry(f"+{x}+{y}")
+        window.configure(bg=INPUT_BORDER)
+        label = tk.Label(
+            window,
+            text=self.text,
+            justify="left",
+            anchor="w",
+            bg=BG3,
+            fg=FG,
+            padx=10,
+            pady=6,
+            wraplength=340,
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+        )
+        label.pack()
+        self._window = window
+
+    def _hide(self) -> None:
+        if self._window is not None:
+            self._window.destroy()
+            self._window = None
+
+
 class App(tk.Tk):
     def __init__(self, initial_input_paths: list[Path] | None = None):
         super().__init__()
@@ -144,7 +221,9 @@ class App(tk.Tk):
         self._advanced_scroll_canvas: tk.Canvas | None = None
         self._log_link_index = 0
         self._suspend_input_sync = False
+        self._tooltips: list[HoverTooltip] = []
         self._initial_input_paths = [path for path in (initial_input_paths or []) if path.exists()]
+        self._applying_imagemagick_preset = False
 
         self.browse_folder_var = tk.StringVar(value=settings["last_browse_folder"])
         self.input_var = tk.StringVar(value=settings["input_path"])
@@ -157,11 +236,18 @@ class App(tk.Tk):
         self.gsbox_var = tk.StringVar(value=settings["gsbox"])
         self.intermediate_dir_var = tk.StringVar(value=settings["intermediate_dir"])
         self.enable_da360_alignment_var = tk.BooleanVar(value=bool(settings["enable_da360_alignment"]))
+        self.alignment_grid_resolution_var = tk.IntVar(value=int(settings["alignment_grid_resolution"]))
+        self.alignment_detail_weight_var = tk.DoubleVar(value=float(settings["alignment_detail_weight"]))
+        self.cutoff_height_percent_var = tk.DoubleVar(value=float(settings["cutoff_height_percent"]))
+        self.enable_alignment_sweep_var = tk.BooleanVar(value=bool(settings["enable_alignment_sweep"]))
         self.keep_intermediates_var = tk.BooleanVar(value=bool(settings["keep_intermediates"]))
         self.delete_temp_files_var = tk.BooleanVar(value=bool(settings["delete_temp_files"]))
         self.enable_seedvr2_upscale_var = tk.BooleanVar(value=bool(settings["enable_seedvr2_upscale"]))
         self.enable_imagemagick_optimization_var = tk.BooleanVar(value=bool(settings["enable_imagemagick_optimization"]))
+        self.enable_deblur_preprocessing_var = tk.BooleanVar(value=bool(settings["enable_deblur_preprocessing"]))
+        self.deblur_strength_var = tk.StringVar(value=str(settings["deblur_strength"]))
         self.imagemagick_path_var = tk.StringVar(value=settings["imagemagick_path"])
+        self.imagemagick_preset_var = tk.StringVar(value=str(settings["imagemagick_preset"]))
         self.imagemagick_auto_level_var = tk.BooleanVar(value=bool(settings["imagemagick_auto_level"]))
         self.imagemagick_auto_gamma_var = tk.BooleanVar(value=bool(settings["imagemagick_auto_gamma"]))
         self.imagemagick_normalize_var = tk.BooleanVar(value=bool(settings["imagemagick_normalize"]))
@@ -179,6 +265,9 @@ class App(tk.Tk):
         self.seedvr2_vae_offload_device_var = tk.StringVar(value=settings["seedvr2_vae_offload_device"])
         self.seedvr2_tensor_offload_device_var = tk.StringVar(value=settings["seedvr2_tensor_offload_device"])
         self.seedvr2_resolution_factor_var = tk.StringVar(value=settings["seedvr2_resolution_factor"])
+        self.seedvr2_stretch_proportions_var = tk.BooleanVar(value=bool(settings["seedvr2_stretch_proportions"]))
+        self.seedvr2_target_short_side_var = tk.StringVar(value=settings["seedvr2_target_short_side"])
+        self.seedvr2_min_resolution_var = tk.StringVar(value=settings["seedvr2_min_resolution"])
         self.seedvr2_max_resolution_var = tk.StringVar(value=settings["seedvr2_max_resolution"])
         self.seedvr2_batch_size_var = tk.StringVar(value=settings["seedvr2_batch_size"])
         self.seedvr2_seed_var = tk.StringVar(value=settings["seedvr2_seed"])
@@ -326,9 +415,9 @@ class App(tk.Tk):
         log_panel.rowconfigure(1, weight=1)
 
         ttk.Label(form_panel, text="Source Browser", style="PanelTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
-        self._browse_row(form_panel, 1, "Source folder", self.browse_folder_var, self._browse_folder)
-        self._browse_row(form_panel, 2, "Input panorama", self.input_var, self._browse_input)
-        self._readonly_row(form_panel, 3, "Output splat", self.output_var)
+        self._browse_row(form_panel, 1, "Source folder", self.browse_folder_var, self._browse_folder, tooltip="Folder that is scanned for stitched 2:1 panoramas shown in the file list.")
+        self._browse_row(form_panel, 2, "Input panorama", self.input_var, self._browse_input, tooltip="Currently selected panorama file to process. A 2:1 equirectangular image is expected.")
+        self._readonly_row(form_panel, 3, "Output splat", self.output_var, tooltip="Final merged splat output path. This is derived automatically from the selected input and format.")
 
         browser_frame = tk.Frame(form_panel, bg=BG2, highlightthickness=1, highlightbackground=CARD_BORDER)
         browser_frame.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(10, 6))
@@ -383,9 +472,8 @@ class App(tk.Tk):
         tk.Label(preview_frame, textvariable=self.temp_hint_var, justify="left", anchor="w", bg=BG2, fg=FG_DIM, wraplength=360).grid(row=3, column=0, sticky="ew")
 
         ttk.Label(form_panel, text="Options", style="PanelTitle.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(18, 10))
-        self._entry_row(form_panel, 6, "Sides", self.side_count_var, "2+ horizon views")
-        self._combo_row(form_panel, 7, "Format", self.format_var, ["ply", "spx", "spz", "sog"])
-        self._combo_row(form_panel, 8, "Device", self.device_var, ["default", "cuda", "cpu", "mps"])
+        self._entry_row(form_panel, 6, "Sides", self.side_count_var, "2+ horizon views", tooltip="Number of perspective views extracted around the horizon. More sides improve coverage but increase runtime.")
+        self._combo_row(form_panel, 7, "Format", self.format_var, ["ply", "spx", "spz", "sog"], tooltip="Output file format. Compressed formats require gsbox.exe and usually save disk space.")
 
         self.keep_check = tk.Checkbutton(
             form_panel,
@@ -398,7 +486,8 @@ class App(tk.Tk):
             selectcolor=BG3,
             highlightthickness=0,
         )
-        self.keep_check.grid(row=9, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.keep_check.grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self._attach_tooltip(self.keep_check, "Keep extracted faces, depth maps, and per-face splats instead of treating them as disposable working files.")
 
         self.delete_temp_check = tk.Checkbutton(
             form_panel,
@@ -411,7 +500,8 @@ class App(tk.Tk):
             selectcolor=BG3,
             highlightthickness=0,
         )
-        self.delete_temp_check.grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.delete_temp_check.grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._attach_tooltip(self.delete_temp_check, "Delete the Temp working directory automatically after a successful run when intermediates are not being kept.")
 
         self.da360_check = tk.Checkbutton(
             form_panel,
@@ -424,7 +514,82 @@ class App(tk.Tk):
             selectcolor=BG3,
             highlightthickness=0,
         )
-        self.da360_check.grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.da360_check.grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._attach_tooltip(self.da360_check, "Use DA360 panorama depth as a reference to normalize SHARP's per-view depth scale before merging.")
+
+        # --- Depth alignment tuner sliders ---
+        tuner_frame = tk.Frame(form_panel, bg=BG2)
+        tuner_frame.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        tuner_frame.columnconfigure(1, weight=1)
+
+        self._grid_res_label = tk.Label(
+            tuner_frame, text="Grid Resolution: 4", bg=BG2, fg=FG, anchor="w",
+        )
+        self._grid_res_label.grid(row=0, column=0, sticky="w", padx=(18, 6))
+        self._attach_tooltip(self._grid_res_label, "Controls how finely the DA360 alignment scale field is sampled. Higher values preserve more local structure but can follow noise more closely. Default: 4.")
+        self.grid_res_scale = tk.Scale(
+            tuner_frame,
+            from_=1, to=64,
+            orient=tk.HORIZONTAL,
+            variable=self.alignment_grid_resolution_var,
+            showvalue=False,
+            bg=BG2, fg=FG, troughcolor=BG3, highlightthickness=0,
+            command=self._on_grid_res_changed,
+        )
+        self.grid_res_scale.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self._on_grid_res_changed(self.alignment_grid_resolution_var.get())
+
+        self._detail_wt_label = tk.Label(
+            tuner_frame, text="Detail Preservation: 0 %", bg=BG2, fg=FG, anchor="w",
+        )
+        self._detail_wt_label.grid(row=1, column=0, sticky="w", padx=(18, 6))
+        self._attach_tooltip(self._detail_wt_label, "Blends between smooth low-frequency alignment and per-point detail recovery. Higher values keep more small-scale SHARP depth structure. Default: 0%.")
+        self.detail_wt_scale = tk.Scale(
+            tuner_frame,
+            from_=0, to=100,
+            orient=tk.HORIZONTAL,
+            variable=tk.IntVar(value=int(self.alignment_detail_weight_var.get() * 100)),
+            showvalue=False,
+            bg=BG2, fg=FG, troughcolor=BG3, highlightthickness=0,
+            command=self._on_detail_wt_changed,
+        )
+        self._detail_wt_int_var = self.detail_wt_scale.cget("variable")
+        self.detail_wt_scale.grid(row=1, column=1, sticky="ew", padx=(0, 6))
+        self._on_detail_wt_changed(int(self.alignment_detail_weight_var.get() * 100))
+
+        self._cutoff_height_label = tk.Label(
+            tuner_frame, text="Cut-off Height: 0 %", bg=BG2, fg=FG, anchor="w",
+        )
+        self._cutoff_height_label.grid(row=2, column=0, sticky="w", padx=(18, 6))
+        self._attach_tooltip(self._cutoff_height_label, "Cuts off the lower part of each extracted panorama slice before SHARP processing to avoid highly distorted lower regions. Default: 0%.")
+        self.cutoff_height_scale = tk.Scale(
+            tuner_frame,
+            from_=0, to=40,
+            orient=tk.HORIZONTAL,
+            variable=tk.IntVar(value=int(self.cutoff_height_percent_var.get())),
+            showvalue=False,
+            bg=BG2, fg=FG, troughcolor=BG3, highlightthickness=0,
+            command=self._on_cutoff_height_changed,
+        )
+        self._cutoff_height_int_var = self.cutoff_height_scale.cget("variable")
+        self.cutoff_height_scale.grid(row=2, column=1, sticky="ew", padx=(0, 6))
+        self._on_cutoff_height_changed(int(self.cutoff_height_percent_var.get()))
+
+        self.alignment_sweep_check = tk.Checkbutton(
+            form_panel,
+            text="Generate 25 alignment variants after one SHARP pass",
+            variable=self.enable_alignment_sweep_var,
+            bg=BG2,
+            fg=FG,
+            activebackground=BG2,
+            activeforeground=FG,
+            selectcolor=BG3,
+            highlightthickness=0,
+        )
+        self.alignment_sweep_check.grid(row=12, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._attach_tooltip(self.alignment_sweep_check, "Create a 5x5 sweep of Grid Resolution and Detail Preservation values after SHARP, SeedVR2, and DA360 have already run once.")
+
+        self._sync_alignment_tuner_state()
 
         self.seedvr2_check = tk.Checkbutton(
             form_panel,
@@ -437,7 +602,8 @@ class App(tk.Tk):
             selectcolor=BG3,
             highlightthickness=0,
         )
-        self.seedvr2_check.grid(row=12, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.seedvr2_check.grid(row=13, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._attach_tooltip(self.seedvr2_check, "Upscale extracted face views with SeedVR2 before SHARP inference. This can recover detail but adds substantial processing time.")
 
         action_bar = ttk.Frame(container)
         action_bar.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -471,25 +637,31 @@ class App(tk.Tk):
     def _build_advanced_panel(self, parent) -> None:
         parent.columnconfigure(1, weight=1)
         ttk.Label(parent, text="Advanced", style="PanelTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
-        self._browse_row(parent, 1, "SHARP-Ckeckpoint", self.checkpoint_var, self._browse_checkpoint)
-        self._browse_row(parent, 2, "DA360 checkpoint", self.da360_checkpoint_var, self._browse_da360_checkpoint)
-        self._browse_row(parent, 3, "gsbox.exe", self.gsbox_var, self._browse_gsbox)
-        self._browse_row(parent, 4, "Intermediate dir", self.intermediate_dir_var, self._browse_intermediate_dir)
+        self._browse_row(parent, 1, "SHARP-Ckeckpoint", self.checkpoint_var, self._browse_checkpoint, tooltip="Optional SHARP model checkpoint. Leave empty to use the default published checkpoint.")
+        self._browse_row(parent, 2, "DA360 checkpoint", self.da360_checkpoint_var, self._browse_da360_checkpoint, tooltip="Checkpoint used by DA360 to estimate panorama depth for scale alignment.")
+        self._browse_row(parent, 3, "gsbox.exe", self.gsbox_var, self._browse_gsbox, tooltip="Path to gsbox.exe. Needed only for compressed output formats like .spx, .spz, or .sog.")
+        self._browse_row(parent, 4, "Intermediate dir", self.intermediate_dir_var, self._browse_intermediate_dir, tooltip="Optional custom location for Temp files, extracted faces, depth maps, and conversion artifacts.")
+        self._combo_row(parent, 5, "Device", self.device_var, ["default", "cuda", "cpu", "mps"], tooltip="Inference device for SHARP and DA360. 'default' automatically picks CUDA when available.")
 
-        ttk.Label(parent, text="ImageMagick", style="PanelTitle.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(18, 10))
-        self._check_row(parent, 6, "Optimize panorama with ImageMagick before slicing", self.enable_imagemagick_optimization_var)
-        self._browse_row(parent, 7, "magick.exe", self.imagemagick_path_var, self._browse_imagemagick)
-        self._check_row(parent, 8, "Auto level", self.imagemagick_auto_level_var)
-        self._check_row(parent, 9, "Auto gamma", self.imagemagick_auto_gamma_var)
-        self._check_row(parent, 10, "Normalize", self.imagemagick_normalize_var)
-        self._check_row(parent, 11, "Enhance", self.imagemagick_enhance_var)
-        self._check_row(parent, 12, "Despeckle", self.imagemagick_despeckle_var)
-        self._check_row(parent, 13, "Apply unsharp mask", self.imagemagick_unsharp_enabled_var)
-        self._entry_row(parent, 14, "Unsharp values", self.imagemagick_unsharp_value_var, "Example: 0x1.2+0.8+0.02")
-        self._entry_row(parent, 15, "Extra args", self.imagemagick_extra_args_var, "Optional extra ImageMagick arguments")
+        ttk.Label(parent, text="ImageMagick", style="PanelTitle.TLabel").grid(row=6, column=0, columnspan=3, sticky="w", pady=(18, 10))
+        self._check_row(parent, 7, "Optimize panorama with ImageMagick before slicing", self.enable_imagemagick_optimization_var, tooltip="Preprocess the panorama with ImageMagick before view extraction to improve contrast and apparent sharpness.")
+        self._browse_row(parent, 8, "magick.exe", self.imagemagick_path_var, self._browse_imagemagick, tooltip="Path to ImageMagick's magick.exe executable used for panorama preprocessing.")
+        self._combo_row(parent, 9, "Preset", self.imagemagick_preset_var, ["blur_safe", "classic", "custom"], tooltip="ImageMagick preprocessing preset. 'blur_safe' is tuned for motion-blurred footage and avoids filters that often create mushy fake detail.")
+        self._check_row(parent, 10, "Auto level", self.imagemagick_auto_level_var, tooltip="Stretch tonal levels automatically to use more of the available intensity range.")
+        self._check_row(parent, 11, "Auto gamma", self.imagemagick_auto_gamma_var, tooltip="Apply automatic gamma correction based on the panorama's brightness distribution.")
+        self._check_row(parent, 12, "Normalize", self.imagemagick_normalize_var, tooltip="Normalize contrast to spread highlights and shadows more evenly.")
+        self._check_row(parent, 13, "Enhance", self.imagemagick_enhance_var, tooltip="Run ImageMagick's enhancement filter to improve local edge clarity. Usually best left off for motion-blurred footage.")
+        self._check_row(parent, 14, "Despeckle", self.imagemagick_despeckle_var, tooltip="Reduce small isolated noise speckles before slicing the panorama into faces. Usually best left off for motion blur because it can smear fine structure.")
+        self._check_row(parent, 15, "Apply unsharp mask", self.imagemagick_unsharp_enabled_var, tooltip="Apply an unsharp mask to emphasize edges and recover apparent sharpness.")
+        self._entry_row(parent, 16, "Unsharp values", self.imagemagick_unsharp_value_var, "Example: 0x1.6+1.2+0.02", tooltip="Raw ImageMagick unsharp-mask parameters in the form radiusxsigma+amount+threshold.")
+        self._entry_row(parent, 17, "Extra args", self.imagemagick_extra_args_var, "Optional extra ImageMagick arguments", tooltip="Additional ImageMagick command-line arguments appended after the structured preprocessing options.")
 
-        ttk.Label(parent, text="SeedVR2", style="PanelTitle.TLabel").grid(row=16, column=0, columnspan=3, sticky="w", pady=(18, 10))
-        self._combo_row(parent, 17, "Model", self.seedvr2_model_name_var, [
+        ttk.Label(parent, text="Deblur", style="PanelTitle.TLabel").grid(row=18, column=0, columnspan=3, sticky="w", pady=(18, 10))
+        self._check_row(parent, 19, "Run motion deblur on extracted faces before SHARP", self.enable_deblur_preprocessing_var, tooltip="Apply a Richardson-Lucy motion deblur stage on the extracted faces before SeedVR2 and SHARP. This targets real capture blur, not just low contrast.")
+        self._combo_row(parent, 20, "Deblur strength", self.deblur_strength_var, ["low", "medium", "high"], tooltip="Controls motion-kernel size, deconvolution iterations, and blend strength for the deblur stage.")
+
+        ttk.Label(parent, text="SeedVR2", style="PanelTitle.TLabel").grid(row=21, column=0, columnspan=3, sticky="w", pady=(18, 10))
+        self._combo_row(parent, 22, "Model", self.seedvr2_model_name_var, [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             "seedvr2_ema_3b_fp16.safetensors",
             "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
@@ -500,32 +672,35 @@ class App(tk.Tk):
             "seedvr2_ema_3b-Q8_0.gguf",
             "seedvr2_ema_7b-Q4_K_M.gguf",
             "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
-        ])
-        self._combo_row(parent, 18, "Output format", self.seedvr2_output_format_var, ["png"])
-        self._combo_row(parent, 19, "Color correction", self.seedvr2_color_correction_var, ["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
-        self._combo_row(parent, 20, "Attention mode", self.seedvr2_attention_mode_var, ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"])
-        self._entry_row(parent, 21, "Resolution factor", self.seedvr2_resolution_factor_var, "Multiplier for extracted face size")
-        self._entry_row(parent, 22, "Max resolution", self.seedvr2_max_resolution_var, "0 disables the cap")
-        self._entry_row(parent, 23, "Batch size", self.seedvr2_batch_size_var, "SeedVR2 image batch size")
-        self._entry_row(parent, 24, "Seed", self.seedvr2_seed_var)
-        self._entry_row(parent, 25, "CUDA device", self.seedvr2_cuda_device_var, "Single GPU id or comma-separated list")
-        self._combo_row(parent, 26, "DiT offload", self.seedvr2_dit_offload_device_var, ["none", "cpu"])
-        self._combo_row(parent, 27, "VAE offload", self.seedvr2_vae_offload_device_var, ["none", "cpu"])
-        self._combo_row(parent, 28, "Tensor offload", self.seedvr2_tensor_offload_device_var, ["none", "cpu"])
-        self._entry_row(parent, 29, "Blocks to swap", self.seedvr2_blocks_to_swap_var, "0-36 depending on model")
-        self._entry_row(parent, 30, "Skip first frames", self.seedvr2_skip_first_frames_var)
-        self._entry_row(parent, 31, "VAE encode tile size", self.seedvr2_vae_encode_tile_size_var)
-        self._entry_row(parent, 32, "VAE encode overlap", self.seedvr2_vae_encode_tile_overlap_var)
-        self._entry_row(parent, 33, "VAE decode tile size", self.seedvr2_vae_decode_tile_size_var)
-        self._entry_row(parent, 34, "VAE decode overlap", self.seedvr2_vae_decode_tile_overlap_var)
-        self._combo_row(parent, 35, "Compile backend", self.seedvr2_compile_backend_var, ["inductor", "cudagraphs"])
-        self._combo_row(parent, 36, "Compile mode", self.seedvr2_compile_mode_var, ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
-        self._check_row(parent, 37, "Swap IO components", self.seedvr2_swap_io_components_var)
-        self._check_row(parent, 38, "Enable VAE encode tiling", self.seedvr2_vae_encode_tiled_var)
-        self._check_row(parent, 39, "Enable VAE decode tiling", self.seedvr2_vae_decode_tiled_var)
-        self._check_row(parent, 40, "Cache DiT model", self.seedvr2_cache_dit_var)
-        self._check_row(parent, 41, "Cache VAE model", self.seedvr2_cache_vae_var)
-        self._check_row(parent, 42, "Enable SeedVR2 debug logging", self.seedvr2_debug_enabled_var)
+        ], tooltip="SeedVR2 model checkpoint or GGUF variant used for face upscaling.")
+        self._combo_row(parent, 23, "Output format", self.seedvr2_output_format_var, ["png"], tooltip="File format used for the upscaled intermediate face images written by SeedVR2.")
+        self._combo_row(parent, 24, "Color correction", self.seedvr2_color_correction_var, ["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"], tooltip="Color-matching method used to preserve the original panorama's look after SeedVR2 upscaling.")
+        self._combo_row(parent, 25, "Attention mode", self.seedvr2_attention_mode_var, ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"], tooltip="Attention backend used by SeedVR2. Faster modes may depend on your GPU and installed libraries.")
+        self._entry_row(parent, 26, "Resolution factor", self.seedvr2_resolution_factor_var, "Multiplier for extracted face size", tooltip="Requested SeedVR2 upscale factor relative to the extracted face resolution.")
+        self._check_row(parent, 27, "Stretch proportions before SeedVR2", self.seedvr2_stretch_proportions_var, tooltip="Resize the short side of each SeedVR2 input face without changing the long side. If min resolution is 0, this now auto-squares to the current long side. This is a true non-uniform stretch, not padding or cropping.")
+        self._entry_row(parent, 28, "Target short side", self.seedvr2_target_short_side_var, "Ignored when min resolution is 0", tooltip="Manual short-side size used only when stretch proportions is enabled and min resolution is above 0. The long side stays unchanged.")
+        self._entry_row(parent, 29, "Min resolution", self.seedvr2_min_resolution_var, "0 disables the floor", tooltip="Minimum longest-side resolution after applying the factor. If the factor result is smaller, SeedVR2 upscales to this minimum instead.")
+        self._entry_row(parent, 30, "Max resolution", self.seedvr2_max_resolution_var, "0 disables the cap", tooltip="Upper bound for the longest side of the upscaled face. Use 0 to disable the clamp.")
+        self._entry_row(parent, 31, "Batch size", self.seedvr2_batch_size_var, "SeedVR2 image batch size", tooltip="How many faces SeedVR2 processes at once. Higher values use more VRAM.")
+        self._entry_row(parent, 32, "Seed", self.seedvr2_seed_var, tooltip="Random seed used by SeedVR2 for reproducible results.")
+        self._entry_row(parent, 33, "CUDA device", self.seedvr2_cuda_device_var, "Single GPU id or comma-separated list", tooltip="GPU id list passed to SeedVR2. Usually leave this as 0 on a single-GPU system.")
+        self._combo_row(parent, 34, "DiT offload", self.seedvr2_dit_offload_device_var, ["none", "cpu"], tooltip="Offload the diffusion transformer to CPU to reduce VRAM usage at the cost of speed.")
+        self._combo_row(parent, 35, "VAE offload", self.seedvr2_vae_offload_device_var, ["none", "cpu"], tooltip="Offload the VAE to CPU to save VRAM. This usually slows processing.")
+        self._combo_row(parent, 36, "Tensor offload", self.seedvr2_tensor_offload_device_var, ["none", "cpu"], tooltip="Move additional working tensors off the GPU when VRAM is tight.")
+        self._entry_row(parent, 37, "Blocks to swap", self.seedvr2_blocks_to_swap_var, "0-36 depending on model", tooltip="Number of model blocks swapped between devices to reduce VRAM usage. Higher values reduce memory but cost speed.")
+        self._entry_row(parent, 38, "Skip first frames", self.seedvr2_skip_first_frames_var, tooltip="Number of initial inputs to skip before SeedVR2 starts processing. Mainly useful for video-oriented workflows.")
+        self._entry_row(parent, 39, "VAE encode tile size", self.seedvr2_vae_encode_tile_size_var, tooltip="Tile size used while encoding images in the VAE to fit larger inputs into VRAM.")
+        self._entry_row(parent, 40, "VAE encode overlap", self.seedvr2_vae_encode_tile_overlap_var, tooltip="Overlap between VAE encode tiles to reduce seam artifacts.")
+        self._entry_row(parent, 41, "VAE decode tile size", self.seedvr2_vae_decode_tile_size_var, tooltip="Tile size used while decoding images in the VAE.")
+        self._entry_row(parent, 42, "VAE decode overlap", self.seedvr2_vae_decode_tile_overlap_var, tooltip="Overlap between VAE decode tiles to reduce seam artifacts.")
+        self._combo_row(parent, 43, "Compile backend", self.seedvr2_compile_backend_var, ["inductor", "cudagraphs"], tooltip="Torch compile backend for SeedVR2. Backend support and speed depend on your environment.")
+        self._combo_row(parent, 44, "Compile mode", self.seedvr2_compile_mode_var, ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], tooltip="Torch compile tuning mode. More aggressive modes may improve speed after longer warmup.")
+        self._check_row(parent, 45, "Swap IO components", self.seedvr2_swap_io_components_var, tooltip="Allow SeedVR2 to swap some input/output components to reduce VRAM pressure.")
+        self._check_row(parent, 46, "Enable VAE encode tiling", self.seedvr2_vae_encode_tiled_var, tooltip="Process VAE encoding in tiles so large faces fit into VRAM.")
+        self._check_row(parent, 47, "Enable VAE decode tiling", self.seedvr2_vae_decode_tiled_var, tooltip="Process VAE decoding in tiles so large faces fit into VRAM.")
+        self._check_row(parent, 48, "Cache DiT model", self.seedvr2_cache_dit_var, tooltip="Keep the diffusion transformer cached in memory between SeedVR2 steps when possible.")
+        self._check_row(parent, 49, "Cache VAE model", self.seedvr2_cache_vae_var, tooltip="Keep the VAE cached in memory between SeedVR2 steps when possible.")
+        self._check_row(parent, 50, "Enable SeedVR2 debug logging", self.seedvr2_debug_enabled_var, tooltip="Enable verbose SeedVR2 logging for troubleshooting and profiling.")
 
         notes = (
             "Browse a source folder and select the stitched 2:1 equirect panorama from the list.\n"
@@ -533,11 +708,12 @@ class App(tk.Tk):
             "Working files default to Source/Temp/<image-name>.\n"
             "Compressed formats .spx, .spz, and .sog need gsbox.exe.\n"
             "DA360 gives a panorama-wide depth reference used to normalize SHARP's per-view scale.\n"
-            "ImageMagick can optimize noisy or slightly blurred panoramas before slicing, and the GUI now detects magick.exe automatically.\n"
+            "ImageMagick now includes a blur-safe preset that avoids filters likely to worsen motion blur.\n"
+            "Optional motion deblur runs on extracted faces before SeedVR2 and SHARP.\n"
             "SeedVR2 options are now stored in the main GUI settings file and override the legacy seedvr2_settings.json file."
         )
         notes_label = tk.Label(parent, text=notes, justify="left", bg=BG2, fg=FG_DIM, wraplength=420)
-        notes_label.grid(row=43, column=0, columnspan=3, sticky="ew", pady=(18, 0))
+        notes_label.grid(row=51, column=0, columnspan=3, sticky="ew", pady=(18, 0))
 
     def _on_scrollable_configure(self, _event, canvas_window: int) -> None:
         if self._scroll_canvas is None:
@@ -607,19 +783,28 @@ class App(tk.Tk):
         canvas.configure(scrollregion=canvas.bbox("all"))
         canvas.itemconfigure(canvas_window, width=canvas.winfo_width())
 
-    def _entry_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, hint: str = "") -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+    def _attach_tooltip(self, widget, text: str = "") -> None:
+        if not text:
+            return
+        self._tooltips.append(HoverTooltip(widget, text))
+
+    def _entry_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, hint: str = "", tooltip: str = "") -> None:
+        label_widget = ttk.Label(parent, text=label)
+        label_widget.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+        self._attach_tooltip(label_widget, tooltip)
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", pady=6)
         ttk.Label(parent, text=hint, style="Subtle.TLabel").grid(row=row, column=2, sticky="w", padx=(10, 0))
 
-    def _combo_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, values: list[str]) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+    def _combo_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, values: list[str], tooltip: str = "") -> None:
+        label_widget = ttk.Label(parent, text=label)
+        label_widget.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+        self._attach_tooltip(label_widget, tooltip)
         combo = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly")
         combo.grid(row=row, column=1, sticky="ew", pady=6)
         ttk.Label(parent, text="", style="Subtle.TLabel").grid(row=row, column=2, sticky="w")
 
-    def _check_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.BooleanVar) -> None:
+    def _check_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.BooleanVar, tooltip: str = "") -> None:
         checkbox = tk.Checkbutton(
             parent,
             text=label,
@@ -632,15 +817,20 @@ class App(tk.Tk):
             highlightthickness=0,
         )
         checkbox.grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self._attach_tooltip(checkbox, tooltip)
 
-    def _browse_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, callback) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+    def _browse_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, callback, tooltip: str = "") -> None:
+        label_widget = ttk.Label(parent, text=label)
+        label_widget.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+        self._attach_tooltip(label_widget, tooltip)
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", pady=6)
         ttk.Button(parent, text="Browse", command=callback).grid(row=row, column=2, sticky="e", padx=(10, 0), pady=6)
 
-    def _readonly_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+    def _readonly_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, tooltip: str = "") -> None:
+        label_widget = ttk.Label(parent, text=label)
+        label_widget.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
+        self._attach_tooltip(label_widget, tooltip)
         entry = ttk.Entry(parent, textvariable=variable, state="readonly")
         entry.grid(row=row, column=1, sticky="ew", pady=6)
         ttk.Label(parent, text="Auto-saved beside source", style="Subtle.TLabel").grid(row=row, column=2, sticky="w", padx=(10, 0))
@@ -657,9 +847,11 @@ class App(tk.Tk):
             self.da360_checkpoint_var,
             self.gsbox_var,
             self.intermediate_dir_var,
+            self.imagemagick_preset_var,
             self.imagemagick_path_var,
             self.imagemagick_unsharp_value_var,
             self.imagemagick_extra_args_var,
+            self.deblur_strength_var,
             self.seedvr2_model_name_var,
             self.seedvr2_output_format_var,
             self.seedvr2_color_correction_var,
@@ -669,6 +861,8 @@ class App(tk.Tk):
             self.seedvr2_vae_offload_device_var,
             self.seedvr2_tensor_offload_device_var,
             self.seedvr2_resolution_factor_var,
+            self.seedvr2_target_short_side_var,
+            self.seedvr2_min_resolution_var,
             self.seedvr2_max_resolution_var,
             self.seedvr2_batch_size_var,
             self.seedvr2_seed_var,
@@ -684,17 +878,25 @@ class App(tk.Tk):
         for variable in variables:
             variable.trace_add("write", self._on_settings_changed)
         self.enable_da360_alignment_var.trace_add("write", self._on_settings_changed)
+        self.enable_da360_alignment_var.trace_add("write", self._on_da360_alignment_changed)
+        self.alignment_grid_resolution_var.trace_add("write", self._on_settings_changed)
+        self.alignment_detail_weight_var.trace_add("write", self._on_settings_changed)
+        self.cutoff_height_percent_var.trace_add("write", self._on_settings_changed)
+        self.enable_alignment_sweep_var.trace_add("write", self._on_settings_changed)
         self.keep_intermediates_var.trace_add("write", self._on_settings_changed)
         self.keep_intermediates_var.trace_add("write", self._on_keep_intermediates_changed)
         self.delete_temp_files_var.trace_add("write", self._on_settings_changed)
         self.enable_seedvr2_upscale_var.trace_add("write", self._on_settings_changed)
         self.enable_imagemagick_optimization_var.trace_add("write", self._on_settings_changed)
+        self.enable_deblur_preprocessing_var.trace_add("write", self._on_settings_changed)
+        self.imagemagick_preset_var.trace_add("write", self._on_imagemagick_preset_changed)
         self.imagemagick_auto_level_var.trace_add("write", self._on_settings_changed)
         self.imagemagick_auto_gamma_var.trace_add("write", self._on_settings_changed)
         self.imagemagick_normalize_var.trace_add("write", self._on_settings_changed)
         self.imagemagick_enhance_var.trace_add("write", self._on_settings_changed)
         self.imagemagick_despeckle_var.trace_add("write", self._on_settings_changed)
         self.imagemagick_unsharp_enabled_var.trace_add("write", self._on_settings_changed)
+        self.seedvr2_stretch_proportions_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_swap_io_components_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_vae_encode_tiled_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_vae_decode_tiled_var.trace_add("write", self._on_settings_changed)
@@ -719,10 +921,16 @@ class App(tk.Tk):
                 "gsbox": self.gsbox_var.get().strip(),
                 "intermediate_dir": self.intermediate_dir_var.get().strip(),
                 "enable_da360_alignment": bool(self.enable_da360_alignment_var.get()),
+                "alignment_grid_resolution": int(self.alignment_grid_resolution_var.get()),
+                "alignment_detail_weight": float(self.alignment_detail_weight_var.get()),
+                "cutoff_height_percent": float(self.cutoff_height_percent_var.get()),
+                "enable_alignment_sweep": bool(self.enable_alignment_sweep_var.get()),
                 "keep_intermediates": bool(self.keep_intermediates_var.get()),
                 "delete_temp_files": bool(self.delete_temp_files_var.get()),
                 "enable_seedvr2_upscale": bool(self.enable_seedvr2_upscale_var.get()),
                 "enable_imagemagick_optimization": bool(self.enable_imagemagick_optimization_var.get()),
+                "enable_deblur_preprocessing": bool(self.enable_deblur_preprocessing_var.get()),
+                "deblur_strength": self.deblur_strength_var.get().strip(),
                 "imagemagick_path": self.imagemagick_path_var.get().strip(),
                 "imagemagick_commands": insp_to_splat.build_imagemagick_command_string(option_values=imagemagick_settings),
                 "seedvr2_model_name": self.seedvr2_model_name_var.get().strip(),
@@ -734,6 +942,9 @@ class App(tk.Tk):
                 "seedvr2_vae_offload_device": self.seedvr2_vae_offload_device_var.get().strip(),
                 "seedvr2_tensor_offload_device": self.seedvr2_tensor_offload_device_var.get().strip(),
                 "seedvr2_resolution_factor": self.seedvr2_resolution_factor_var.get().strip(),
+                "seedvr2_stretch_proportions": bool(self.seedvr2_stretch_proportions_var.get()),
+                "seedvr2_target_short_side": self.seedvr2_target_short_side_var.get().strip(),
+                "seedvr2_min_resolution": self.seedvr2_min_resolution_var.get().strip(),
                 "seedvr2_max_resolution": self.seedvr2_max_resolution_var.get().strip(),
                 "seedvr2_batch_size": self.seedvr2_batch_size_var.get().strip(),
                 "seedvr2_seed": self.seedvr2_seed_var.get().strip(),
@@ -780,6 +991,39 @@ class App(tk.Tk):
             self.delete_temp_check.configure(state="disabled")
         else:
             self.delete_temp_check.configure(state="normal")
+
+    def _on_da360_alignment_changed(self, *_args) -> None:
+        self._sync_alignment_tuner_state()
+
+    def _sync_alignment_tuner_state(self) -> None:
+        enabled = getattr(self, "enable_da360_alignment_var", None) and self.enable_da360_alignment_var.get()
+        state = "normal" if enabled else "disabled"
+        for widget in (
+            getattr(self, "grid_res_scale", None),
+            getattr(self, "detail_wt_scale", None),
+            getattr(self, "cutoff_height_scale", None),
+            getattr(self, "_grid_res_label", None),
+            getattr(self, "_detail_wt_label", None),
+            getattr(self, "_cutoff_height_label", None),
+            getattr(self, "alignment_sweep_check", None),
+        ):
+            if widget is not None:
+                widget.configure(state=state)
+
+    def _on_grid_res_changed(self, value) -> None:
+        v = int(float(value))
+        self._grid_res_label.configure(text=f"Grid Resolution: {v}")
+        self.alignment_grid_resolution_var.set(v)
+
+    def _on_detail_wt_changed(self, value) -> None:
+        v = int(float(value))
+        self._detail_wt_label.configure(text=f"Detail Preservation: {v} %")
+        self.alignment_detail_weight_var.set(v / 100.0)
+
+    def _on_cutoff_height_changed(self, value) -> None:
+        v = int(float(value))
+        self._cutoff_height_label.configure(text=f"Cut-off Height: {v} %")
+        self.cutoff_height_percent_var.set(float(v))
 
     def _on_format_changed(self, *_args) -> None:
         self._sync_output_extension()
@@ -976,6 +1220,7 @@ class App(tk.Tk):
 
     def _build_imagemagick_option_values(self) -> dict[str, object]:
         return {
+            "imagemagick_preset": self.imagemagick_preset_var.get().strip(),
             "imagemagick_auto_level": bool(self.imagemagick_auto_level_var.get()),
             "imagemagick_auto_gamma": bool(self.imagemagick_auto_gamma_var.get()),
             "imagemagick_normalize": bool(self.imagemagick_normalize_var.get()),
@@ -985,6 +1230,32 @@ class App(tk.Tk):
             "imagemagick_unsharp_value": self.imagemagick_unsharp_value_var.get().strip(),
             "imagemagick_extra_args": self.imagemagick_extra_args_var.get().strip(),
         }
+
+    def _apply_imagemagick_preset(self, preset_name: str) -> None:
+        normalized = insp_to_splat.normalize_imagemagick_preset_name(preset_name)
+        if normalized == "custom":
+            self._on_settings_changed()
+            return
+        preset_settings = insp_to_splat.get_imagemagick_preset_settings(normalized)
+        self._applying_imagemagick_preset = True
+        try:
+            self.imagemagick_preset_var.set(normalized)
+            self.imagemagick_auto_level_var.set(bool(preset_settings["imagemagick_auto_level"]))
+            self.imagemagick_auto_gamma_var.set(bool(preset_settings["imagemagick_auto_gamma"]))
+            self.imagemagick_normalize_var.set(bool(preset_settings["imagemagick_normalize"]))
+            self.imagemagick_enhance_var.set(bool(preset_settings["imagemagick_enhance"]))
+            self.imagemagick_despeckle_var.set(bool(preset_settings["imagemagick_despeckle"]))
+            self.imagemagick_unsharp_enabled_var.set(bool(preset_settings["imagemagick_unsharp_enabled"]))
+            self.imagemagick_unsharp_value_var.set(str(preset_settings["imagemagick_unsharp_value"]))
+            self.imagemagick_extra_args_var.set(str(preset_settings["imagemagick_extra_args"]))
+        finally:
+            self._applying_imagemagick_preset = False
+        self._on_settings_changed()
+
+    def _on_imagemagick_preset_changed(self, *_args) -> None:
+        if self._applying_imagemagick_preset:
+            return
+        self._apply_imagemagick_preset(self.imagemagick_preset_var.get())
 
     def _browse_da360_checkpoint(self) -> None:
         path = filedialog.askopenfilename(
@@ -1053,10 +1324,18 @@ class App(tk.Tk):
 
     def _extract_output_path_from_log_message(self, message: str) -> Path | None:
         prefixes = (
+            "Created ",
             "Finished successfully: ",
             "Wrote merged output to ",
         )
         for prefix in prefixes:
+            if prefix == "Created ":
+                marker = " outputs in: "
+                if message.startswith(prefix) and marker in message:
+                    candidate = message.split(marker, 1)[1].strip()
+                    if candidate:
+                        return Path(candidate)
+                continue
             if message.startswith(prefix):
                 candidate = message[len(prefix):].strip()
                 if candidate:
@@ -1068,6 +1347,8 @@ class App(tk.Tk):
         try:
             if target.exists() and target.is_file():
                 subprocess.Popen(["explorer", "/select,", str(target)])
+            elif target.exists() and target.is_dir():
+                os.startfile(str(target))
             elif output_path.parent.exists():
                 os.startfile(str(output_path.parent))
             else:
@@ -1141,6 +1422,9 @@ class App(tk.Tk):
             if not Path(da360_checkpoint).exists():
                 messagebox.showerror("Missing DA360 checkpoint", "The selected DA360 checkpoint does not exist.")
                 return False
+        elif self.enable_alignment_sweep_var.get():
+            messagebox.showerror("DA360 alignment required", "Alignment sweep mode requires DA360 alignment to stay enabled.")
+            return False
         if self.enable_imagemagick_optimization_var.get():
             magick_path = insp_to_splat.find_imagemagick_executable(self.imagemagick_path_var.get().strip())
             if magick_path is None:
@@ -1153,6 +1437,20 @@ class App(tk.Tk):
             if self.imagemagick_unsharp_enabled_var.get() and not self.imagemagick_unsharp_value_var.get().strip():
                 messagebox.showerror("ImageMagick unsharp required", "Provide unsharp values or disable the unsharp option.")
                 return False
+        if self.enable_seedvr2_upscale_var.get() and self.seedvr2_stretch_proportions_var.get():
+            min_resolution_text = self.seedvr2_min_resolution_var.get().strip()
+            try:
+                min_resolution = int(min_resolution_text) if min_resolution_text else 0
+            except ValueError:
+                messagebox.showerror("Invalid SeedVR2 minimum resolution", "Min resolution must be an integer.")
+                return False
+            if min_resolution > 0:
+                try:
+                    if int(self.seedvr2_target_short_side_var.get().strip()) <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Invalid SeedVR2 stretch", "Target short side must be an integer greater than 0 when stretch proportions is enabled and min resolution is above 0.")
+                    return False
         if self.format_var.get().strip() in {"spx", "spz", "sog"} and not self.gsbox_var.get().strip() and not (ROOT_DIR / "gsbox.exe").exists():
             messagebox.showerror("gsbox required", "Compressed output needs gsbox.exe. Pick it in the GUI or place it next to this script.")
             return False
@@ -1183,10 +1481,16 @@ class App(tk.Tk):
             checkpoint=Path(checkpoint_text) if checkpoint_text else None,
             da360_checkpoint=Path(da360_checkpoint_text) if da360_checkpoint_text else None,
             enable_da360_alignment=bool(self.enable_da360_alignment_var.get()),
+            alignment_grid_resolution=int(self.alignment_grid_resolution_var.get()),
+            alignment_detail_weight=float(self.alignment_detail_weight_var.get()),
+            cutoff_height_percent=float(self.cutoff_height_percent_var.get()),
+            enable_alignment_sweep=bool(self.enable_alignment_sweep_var.get()),
             keep_intermediates=bool(self.keep_intermediates_var.get()),
             delete_temp_files=bool(self.delete_temp_files_var.get()),
             enable_seedvr2_upscale=bool(self.enable_seedvr2_upscale_var.get()),
             enable_imagemagick_optimization=bool(self.enable_imagemagick_optimization_var.get()),
+            enable_deblur_preprocessing=bool(self.enable_deblur_preprocessing_var.get()),
+            deblur_strength=self.deblur_strength_var.get().strip() or "medium",
             imagemagick=Path(self.imagemagick_path_var.get().strip()) if self.imagemagick_path_var.get().strip() else None,
             imagemagick_commands=insp_to_splat.build_imagemagick_command_string(option_values=imagemagick_settings),
             intermediate_dir=intermediate_dir,
@@ -1233,7 +1537,10 @@ class App(tk.Tk):
             self.after(0, lambda: self._finish_pipeline(False, None))
         else:
             for result in results:
-                self._log_queue.put(("info", f"Finished successfully: {result.output_path}"))
+                display_path = getattr(result, "display_path", None) or result.output_path
+                if getattr(result, "generated_outputs", None) and len(result.generated_outputs) > 1:
+                    self._log_queue.put(("info", f"Created {len(result.generated_outputs)} outputs in: {display_path}"))
+                self._log_queue.put(("info", f"Finished successfully: {display_path}"))
             self.after(0, lambda r=results: self._finish_pipeline(True, r))
         finally:
             logger.removeHandler(handler)
@@ -1244,14 +1551,19 @@ class App(tk.Tk):
         self.progress.stop()
         if success and results:
             last_result = results[-1]
+            display_path = getattr(last_result, "display_path", None) or last_result.output_path
+            generated_count = len(getattr(last_result, "generated_outputs", []) or [])
             if len(results) == 1:
-                self.status_var.set(f"Done: {last_result.output_path.name}")
+                if generated_count > 1:
+                    self.status_var.set(f"Done: {display_path.name} ({generated_count} outputs)")
+                else:
+                    self.status_var.set(f"Done: {display_path.name}")
             else:
                 self.status_var.set(f"Done: {len(results)} files processed")
             self.output_var.set(str(last_result.output_path))
             self._update_preview()
             if len(results) == 1:
-                self._show_completion_popup(last_result.output_path)
+                self._show_completion_popup(display_path)
             else:
                 messagebox.showinfo("Batch complete", f"Processed {len(results)} panoramas successfully.\nSee the log for clickable output paths.")
         else:

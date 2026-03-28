@@ -9,8 +9,8 @@ This project expects already-stitched panoramas exported from tools such as Inst
 ## What It Does
 
 - Loads stitched 2:1 panorama images from a folder browser
-- Mirrors the input panorama horizontally before SHARP processing to compensate for SHARP's orientation behavior in this workflow
-- Optionally preprocesses the panorama with ImageMagick before slicing
+- Optionally preprocesses the panorama with ImageMagick before slicing, including a blur-safe preset for motion-blurred footage
+- Optionally applies motion deblur to extracted faces before SeedVR2 and SHARP
 - Optionally sharpens and upscales extracted faces with SeedVR2 before SHARP prediction
 - Optionally aligns SHARP depth scale against DA360 panorama depth
 - Merges all predicted view splats into one final output
@@ -25,6 +25,8 @@ This project expects already-stitched panoramas exported from tools such as Inst
 - Clickable output paths in the log and completion dialog
 - Optional automatic Temp workspace cleanup after processing
 - Optional repo-managed ImageMagick install under `third_party/ImageMagick`
+- Blur-safe ImageMagick preset tuned for shaky capture and motion blur
+- Optional motion deblur on extracted faces before SHARP inference
 - Optional SeedVR2 face upscaling with settings exposed in the GUI
 - Optional DA360-based depth normalization for cross-view scale consistency
 
@@ -122,6 +124,7 @@ ImageMagick is handled as a repo-managed third-party tool instead of being commi
 
 Current ImageMagick operations exposed in the GUI:
 
+- Preset selector (`blur_safe`, `classic`, `custom`)
 - Auto level
 - Auto gamma
 - Normalize
@@ -130,6 +133,18 @@ Current ImageMagick operations exposed in the GUI:
 - Unsharp mask
 - Extra args
 
+The default preset is now `blur_safe`, which keeps tone/contrast recovery but disables `Enhance` and `Despeckle` because those two filters often make motion-blurred footage look worse.
+
+## Deblur Preprocessing
+
+An optional motion-deblur stage can run on extracted faces before SeedVR2 and SHARP.
+
+- It uses Richardson-Lucy deconvolution with an automatically selected motion angle.
+- It operates on the face luminance channel and blends the restored result back into the original color image.
+- Strength can be set to `low`, `medium`, or `high` in the GUI.
+
+This is meant to help with real capture blur from camera movement. It will not fully recover detail lost to severe motion smear, but it is materially different from simple sharpening.
+
 ## SeedVR2 Integration
 
 SeedVR2 is not vendored into the main repository. Setup clones it from its upstream repository and installs its runtime dependencies locally.
@@ -137,11 +152,14 @@ SeedVR2 is not vendored into the main repository. Setup clones it from its upstr
 In the GUI you can enable face upscaling before SHARP prediction and configure key SeedVR2 parameters such as:
 
 - model
+- optional non-uniform stretch of the short side before the normal SeedVR2 run
 - resolution factor
 - batch size
 - offload settings
 - compile backend and mode
 - VAE tiling
+
+The SeedVR2 stretch option resizes only the short side of each extracted face while leaving the long side unchanged. It is applied as a temporary preprocessing step before the regular SeedVR2 run, without padding or cropping.
 
 ## DA360 Alignment
 

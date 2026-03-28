@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import importlib
 import json
 import logging
+import os
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
@@ -16,6 +19,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+
+try:
+    from scipy.signal import fftconvolve
+except ImportError:  # pragma: no cover
+    fftconvolve = None
 
 try:
     from pillow_heif import register_heif_opener
@@ -45,7 +58,30 @@ DEFAULT_DA360_CHECKPOINT_PATH = resolve_resource_path("checkpoints", "DA360_larg
 GUI_SETTINGS_PATH = resolve_resource_path("easy_360_sharp_gui_settings.json")
 SEEDVR2_SETTINGS_PATH = resolve_resource_path("seedvr2_settings.json")
 SEEDVR2_CLI_PATH = resolve_resource_path("seedvr2_videoupscaler", "inference_cli.py")
-DEFAULT_IMAGEMAGICK_COMMANDS = "-auto-level -auto-gamma -normalize -enhance -despeckle -unsharp 0x1.2+0.8+0.02"
+IMAGEMAGICK_PRESET_SETTINGS: dict[str, dict[str, Any]] = {
+    "blur_safe": {
+        "imagemagick_auto_level": True,
+        "imagemagick_auto_gamma": True,
+        "imagemagick_normalize": True,
+        "imagemagick_enhance": False,
+        "imagemagick_despeckle": False,
+        "imagemagick_unsharp_enabled": True,
+        "imagemagick_unsharp_value": "0x1.6+1.2+0.02",
+        "imagemagick_extra_args": "",
+    },
+    "classic": {
+        "imagemagick_auto_level": True,
+        "imagemagick_auto_gamma": True,
+        "imagemagick_normalize": True,
+        "imagemagick_enhance": True,
+        "imagemagick_despeckle": True,
+        "imagemagick_unsharp_enabled": True,
+        "imagemagick_unsharp_value": "0x1.2+0.8+0.02",
+        "imagemagick_extra_args": "",
+    },
+}
+DEFAULT_IMAGEMAGICK_PRESET = "blur_safe"
+DEFAULT_IMAGEMAGICK_COMMANDS = "-auto-level -auto-gamma -normalize -unsharp 0x1.6+1.2+0.02"
 IMAGEMAGICK_OPTION_FLAGS = (
     ("imagemagick_auto_level", "-auto-level"),
     ("imagemagick_auto_gamma", "-auto-gamma"),
@@ -54,15 +90,19 @@ IMAGEMAGICK_OPTION_FLAGS = (
     ("imagemagick_despeckle", "-despeckle"),
 )
 DEFAULT_IMAGEMAGICK_GUI_SETTINGS = {
-    "imagemagick_auto_level": True,
-    "imagemagick_auto_gamma": True,
-    "imagemagick_normalize": True,
-    "imagemagick_enhance": True,
-    "imagemagick_despeckle": True,
-    "imagemagick_unsharp_enabled": True,
-    "imagemagick_unsharp_value": "0x1.2+0.8+0.02",
-    "imagemagick_extra_args": "",
+    "imagemagick_preset": DEFAULT_IMAGEMAGICK_PRESET,
+    **IMAGEMAGICK_PRESET_SETTINGS[DEFAULT_IMAGEMAGICK_PRESET],
 }
+DEFAULT_DEBLUR_GUI_SETTINGS = {
+    "enable_deblur_preprocessing": False,
+    "deblur_strength": "medium",
+}
+DEBLUR_PROFILES: dict[str, dict[str, Any]] = {
+    "low": {"kernel_length": 7, "iterations": 5, "blend": 0.35, "preview_iterations": 2},
+    "medium": {"kernel_length": 11, "iterations": 7, "blend": 0.5, "preview_iterations": 3},
+    "high": {"kernel_length": 15, "iterations": 9, "blend": 0.65, "preview_iterations": 4},
+}
+DEBLUR_ANGLE_CANDIDATES = (0.0, 30.0, 45.0, 60.0, 90.0, 120.0, 135.0, 150.0)
 SUPPORTED_INPUT_SUFFIXES = {".jpg", ".jpeg", ".png", ".heic"}
 COMPRESSED_OUTPUT_SUFFIXES = {".spx", ".spz", ".sog"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -77,6 +117,29 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger("insp_to_splat")
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 1.0:
+        return f"{seconds * 1000.0:.0f} ms"
+    if seconds < 60.0:
+        return f"{seconds:.2f} s"
+    minutes, remaining = divmod(seconds, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)}m {remaining:.1f}s"
+    hours, minutes = divmod(minutes, 60.0)
+    return f"{int(hours)}h {int(minutes)}m {remaining:.1f}s"
+
+
+@contextmanager
+def log_timed_step(step_name: str) -> Iterable[None]:
+    start = time.perf_counter()
+    try:
+        yield
+    except Exception:
+        LOGGER.info("Step failed: %s after %s", step_name, format_duration(time.perf_counter() - start))
+        raise
+    LOGGER.info("Step complete: %s in %s", step_name, format_duration(time.perf_counter() - start))
 
 
 @dataclass(frozen=True)
@@ -96,6 +159,9 @@ class ExtractionLayout:
     name: str
     views: tuple[FaceOrientation, ...]
     focal_px: float
+    focal_y_px: float
+    image_width: int
+    image_height: int
 
 
 @dataclass(frozen=True)
@@ -110,6 +176,8 @@ class DA360Predictor:
 class PipelineResult:
     output_path: Path
     depth_map_path: Path | None = None
+    generated_outputs: list[Path] | None = None
+    display_path: Path | None = None
 
 
 FACE_ORIENTATIONS = (
@@ -224,6 +292,17 @@ def parse_args() -> argparse.Namespace:
         help="Optimize the panorama with ImageMagick before slicing it into SHARP views.",
     )
     parser.add_argument(
+        "--enable-deblur-preprocessing",
+        action="store_true",
+        help="Apply a motion-deblur stage on extracted faces before SeedVR2 and SHARP.",
+    )
+    parser.add_argument(
+        "--deblur-strength",
+        choices=("low", "medium", "high"),
+        default="medium",
+        help="Strength of the motion-deblur stage applied to extracted faces.",
+    )
+    parser.add_argument(
         "--imagemagick",
         type=Path,
         default=None,
@@ -234,6 +313,29 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_IMAGEMAGICK_COMMANDS,
         help="ImageMagick command string applied before slicing.",
+    )
+    parser.add_argument(
+        "--alignment-grid-resolution",
+        type=int,
+        default=8,
+        help="NxN grid size for DA360 depth alignment (1-64). Higher values preserve finer spatial detail.",
+    )
+    parser.add_argument(
+        "--alignment-detail-weight",
+        type=float,
+        default=0.0,
+        help="Blend between smooth grid scale (0.0) and per-point raw scale (1.0) for depth alignment detail.",
+    )
+    parser.add_argument(
+        "--cutoff-height-percent",
+        type=float,
+        default=0.0,
+        help="Crop away the bottom part of each extracted slice before SHARP inference (0-40 percent).",
+    )
+    parser.add_argument(
+        "--enable-alignment-sweep",
+        action="store_true",
+        help="Generate a 5x5 sweep of grid-resolution/detail-preservation variants after SHARP inference has run once.",
     )
     parser.add_argument(
         "--verbose",
@@ -269,6 +371,9 @@ def load_seedvr2_settings() -> dict:
         "vae_offload_device": "seedvr2_vae_offload_device",
         "tensor_offload_device": "seedvr2_tensor_offload_device",
         "resolution_factor": "seedvr2_resolution_factor",
+        "stretch_proportions": "seedvr2_stretch_proportions",
+        "target_short_side": "seedvr2_target_short_side",
+        "min_resolution": "seedvr2_min_resolution",
         "max_resolution": "seedvr2_max_resolution",
         "batch_size": "seedvr2_batch_size",
         "seed": "seedvr2_seed",
@@ -291,6 +396,220 @@ def load_seedvr2_settings() -> dict:
         if gui_key in gui_settings:
             settings[target_key] = gui_settings[gui_key]
     return settings
+
+
+def resolve_seedvr2_stretch_dimensions(
+    image_width: int,
+    image_height: int,
+    settings: Mapping[str, Any],
+) -> tuple[int, int, bool]:
+    if not bool(settings.get("stretch_proportions", False)):
+        return image_width, image_height, False
+
+    short_side = min(image_width, image_height)
+    long_side = max(image_width, image_height)
+    min_res = int(settings.get("min_resolution", 0) or 0)
+
+    # When no minimum output resolution floor is set, stretching defaults to a
+    # square input that matches the current long side.
+    if min_res <= 0:
+        if image_width >= image_height:
+            target_width, target_height = long_side, long_side
+        else:
+            target_width, target_height = long_side, long_side
+        return target_width, target_height, (target_width, target_height) != (image_width, image_height)
+
+    target_short_side_raw = settings.get("target_short_side", 0)
+    try:
+        target_short_side = int(target_short_side_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SeedVR2 target short side must be an integer when stretch proportions is enabled.") from exc
+
+    if target_short_side <= 0:
+        raise ValueError("SeedVR2 target short side must be greater than 0 when stretch proportions is enabled.")
+
+    if target_short_side < short_side:
+        raise ValueError(
+            f"SeedVR2 target short side {target_short_side} is smaller than the current short side {short_side}."
+        )
+    if target_short_side > long_side:
+        raise ValueError(
+            f"SeedVR2 target short side {target_short_side} exceeds the current long side {long_side}."
+        )
+
+    if image_width >= image_height:
+        target_width, target_height = long_side, target_short_side
+    else:
+        target_width, target_height = target_short_side, long_side
+    return target_width, target_height, (target_width, target_height) != (image_width, image_height)
+
+
+def normalize_imagemagick_preset_name(name: str | None) -> str:
+    normalized = str(name or DEFAULT_IMAGEMAGICK_PRESET).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in IMAGEMAGICK_PRESET_SETTINGS:
+        return normalized
+    if normalized == "default":
+        return DEFAULT_IMAGEMAGICK_PRESET
+    return "custom"
+
+
+def get_imagemagick_preset_settings(name: str | None) -> dict[str, Any]:
+    preset_name = normalize_imagemagick_preset_name(name)
+    if preset_name in IMAGEMAGICK_PRESET_SETTINGS:
+        return {
+            "imagemagick_preset": preset_name,
+            **IMAGEMAGICK_PRESET_SETTINGS[preset_name],
+        }
+    return dict(DEFAULT_IMAGEMAGICK_GUI_SETTINGS)
+
+
+def infer_imagemagick_preset_name(settings: Mapping[str, Any] | None) -> str:
+    if not settings:
+        return DEFAULT_IMAGEMAGICK_PRESET
+    for preset_name, preset_settings in IMAGEMAGICK_PRESET_SETTINGS.items():
+        matches = True
+        for key, expected_value in preset_settings.items():
+            if settings.get(key) != expected_value:
+                matches = False
+                break
+        if matches:
+            return preset_name
+    return "custom"
+
+
+def normalize_deblur_strength(strength: str | None) -> str:
+    normalized = str(strength or "medium").strip().lower()
+    if normalized not in DEBLUR_PROFILES:
+        raise ValueError(f"Unsupported deblur strength: {strength}")
+    return normalized
+
+
+def resolve_deblur_profile(strength: str | None) -> dict[str, Any]:
+    profile_name = normalize_deblur_strength(strength)
+    return {"strength": profile_name, **DEBLUR_PROFILES[profile_name]}
+
+
+def build_motion_psf(length: int, angle_deg: float) -> np.ndarray:
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for motion deblur but is not installed in the current Python environment.")
+    size = max(3, int(length))
+    kernel = np.zeros((size, size), dtype=np.float32)
+    center = size // 2
+    cv2.line(kernel, (0, center), (size - 1, center), 1.0, 1, lineType=cv2.LINE_AA)
+    rotation = cv2.getRotationMatrix2D((center, center), float(angle_deg), 1.0)
+    kernel = cv2.warpAffine(kernel, rotation, (size, size), flags=cv2.INTER_CUBIC)
+    kernel = np.clip(kernel, 0.0, None)
+    kernel_sum = float(kernel.sum())
+    if kernel_sum <= 1e-8:
+        kernel[center, center] = 1.0
+        kernel_sum = 1.0
+    return kernel / kernel_sum
+
+
+def richardson_lucy_deblur(image: np.ndarray, psf: np.ndarray, iterations: int) -> np.ndarray:
+    if fftconvolve is None:
+        raise RuntimeError("SciPy is required for deblur preprocessing but is not installed in the current Python environment.")
+    estimate = np.clip(image.astype(np.float32, copy=True), 0.0, 1.0)
+    observed = np.clip(image.astype(np.float32, copy=False), 0.0, 1.0)
+    psf_mirror = psf[::-1, ::-1]
+    for _ in range(max(1, int(iterations))):
+        conv = fftconvolve(estimate, psf, mode="same")
+        relative = observed / np.maximum(conv, 1e-5)
+        estimate *= fftconvolve(relative, psf_mirror, mode="same")
+        estimate = np.clip(estimate, 0.0, 1.0)
+    return estimate
+
+
+def score_sharpness_laplacian(image: np.ndarray) -> float:
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for deblur preprocessing but is not installed in the current Python environment.")
+    laplacian = cv2.Laplacian(image.astype(np.float32, copy=False), cv2.CV_32F)
+    return float(laplacian.var())
+
+
+def estimate_motion_angle(luma: np.ndarray, profile: Mapping[str, Any]) -> float:
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for deblur preprocessing but is not installed in the current Python environment.")
+    preview = luma.astype(np.float32, copy=False)
+    preview_height, preview_width = preview.shape[:2]
+    preview_longest = max(preview_height, preview_width)
+    if preview_longest > 768:
+        scale = 768.0 / float(preview_longest)
+        preview = cv2.resize(preview, (max(1, int(round(preview_width * scale))), max(1, int(round(preview_height * scale)))), interpolation=cv2.INTER_AREA)
+
+    best_angle = 0.0
+    best_score = float("-inf")
+    preview_iterations = int(profile.get("preview_iterations", 2))
+    kernel_length = int(profile.get("kernel_length", 11))
+    for angle_deg in DEBLUR_ANGLE_CANDIDATES:
+        psf = build_motion_psf(kernel_length, angle_deg)
+        restored = richardson_lucy_deblur(preview, psf, preview_iterations)
+        score = score_sharpness_laplacian(restored)
+        if score > best_score:
+            best_score = score
+            best_angle = float(angle_deg)
+    return best_angle
+
+
+def deblur_face_image(image_array: np.ndarray, profile: Mapping[str, Any]) -> np.ndarray:
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for deblur preprocessing but is not installed in the current Python environment.")
+    rgb = np.clip(image_array.astype(np.float32) / 255.0, 0.0, 1.0)
+    ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+    luma = ycrcb[..., 0]
+    angle_deg = estimate_motion_angle(luma, profile)
+    psf = build_motion_psf(int(profile["kernel_length"]), angle_deg)
+    restored_luma = richardson_lucy_deblur(luma, psf, int(profile["iterations"]))
+    blend = float(profile["blend"])
+    ycrcb[..., 0] = np.clip((1.0 - blend) * luma + blend * restored_luma, 0.0, 1.0)
+    restored_rgb = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2RGB)
+    LOGGER.info(
+        "Deblurred face using motion angle %.0f deg (kernel=%d, iterations=%d, blend=%.2f)",
+        angle_deg,
+        int(profile["kernel_length"]),
+        int(profile["iterations"]),
+        blend,
+    )
+    return np.clip(np.round(restored_rgb * 255.0), 0, 255).astype(np.uint8)
+
+
+def deblur_faces_with_motion_rl(
+    faces: Mapping[str, np.ndarray],
+    strength: str,
+) -> dict[str, np.ndarray]:
+    profile = resolve_deblur_profile(strength)
+    LOGGER.info(
+        "Running motion deblur on %d faces (strength=%s, kernel=%d, iterations=%d, blend=%.2f)",
+        len(faces),
+        profile["strength"],
+        int(profile["kernel_length"]),
+        int(profile["iterations"]),
+        float(profile["blend"]),
+    )
+    return {
+        name: deblur_face_image(image_array, profile)
+        for name, image_array in faces.items()
+    }
+
+
+def resolve_seedvr2_target_dimensions(
+    image_width: int,
+    image_height: int,
+    settings: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    factor = int(settings.get("resolution_factor", 2))
+    min_res = int(settings.get("min_resolution", 0))
+    max_res = int(settings.get("max_resolution", 0))
+    longest_side = max(image_width, image_height)
+    target_resolution = longest_side * factor
+    if min_res > 0 and target_resolution < min_res:
+        target_resolution = min_res
+    if max_res > 0 and target_resolution > max_res:
+        target_resolution = max_res
+    scale_factor = target_resolution / float(max(1, longest_side))
+    expected_image_width = max(1, int(round(image_width * scale_factor)))
+    expected_image_height = max(1, int(round(image_height * scale_factor)))
+    return target_resolution, expected_image_width, expected_image_height
 
 
 def parse_imagemagick_gui_settings(raw_settings: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -460,20 +779,51 @@ def sharpen_panorama(image: np.ndarray) -> np.ndarray:
 
 def upscale_faces_with_seedvr2(
     faces: dict[str, np.ndarray],
-    face_size: int,
+    image_width: int,
+    image_height: int,
     temp_root: Path,
-) -> tuple[dict[str, np.ndarray], int]:
+) -> tuple[dict[str, np.ndarray], int, int]:
     settings = load_seedvr2_settings()
+    seedvr2_input_width, seedvr2_input_height, stretch_applied = resolve_seedvr2_stretch_dimensions(
+        image_width,
+        image_height,
+        settings,
+    )
     factor = int(settings.get("resolution_factor", 2))
-    target_resolution = face_size * factor
+    min_res = int(settings.get("min_resolution", 0))
+    max_res = int(settings.get("max_resolution", 0))
+    longest_side = max(seedvr2_input_width, seedvr2_input_height)
+    target_resolution, expected_image_width, expected_image_height = resolve_seedvr2_target_dimensions(
+        seedvr2_input_width,
+        seedvr2_input_height,
+        settings,
+    )
 
     input_dir = temp_root / "seedvr2_input"
     output_dir = temp_root / "seedvr2_output"
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if stretch_applied:
+        stretch_target_label = (
+            f"auto-square from long side {max(image_width, image_height)}"
+            if int(settings.get("min_resolution", 0) or 0) <= 0
+            else str(settings.get("target_short_side", ""))
+        )
+        LOGGER.info(
+            "Stretching SeedVR2 inputs before upscale: %dx%d -> %dx%d (target short side %s)",
+            image_width,
+            image_height,
+            seedvr2_input_width,
+            seedvr2_input_height,
+            stretch_target_label,
+        )
+
     for name, image_array in faces.items():
-        Image.fromarray(image_array).save(input_dir / f"{name}.png")
+        image = Image.fromarray(image_array)
+        if stretch_applied:
+            image = image.resize((seedvr2_input_width, seedvr2_input_height), Image.Resampling.LANCZOS)
+        image.save(input_dir / f"{name}.png")
 
     python_exe = sys.executable
     cmd: list[str] = [
@@ -495,7 +845,6 @@ def upscale_faces_with_seedvr2(
         "--compile_mode", settings.get("compile_mode", "default"),
     ]
 
-    max_res = int(settings.get("max_resolution", 0))
     if max_res > 0:
         cmd += ["--max_resolution", str(max_res)]
 
@@ -525,8 +874,8 @@ def upscale_faces_with_seedvr2(
         cmd.append("--debug")
 
     LOGGER.info(
-        "Running SeedVR2 upscale: %d faces, %dx%d -> %dx%d (factor %d)",
-        len(faces), face_size, face_size, target_resolution, target_resolution, factor,
+        "Running SeedVR2 upscale: %d faces, %dx%d input (%dx%d after stretch) -> longest side %d, target %d (factor %d, min %d, max %d)",
+        len(faces), image_width, image_height, seedvr2_input_width, seedvr2_input_height, longest_side, target_resolution, factor, min_res, max_res,
     )
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -539,11 +888,23 @@ def upscale_faces_with_seedvr2(
         if not out_path.exists():
             raise FileNotFoundError(f"SeedVR2 did not produce expected output: {out_path}")
         with Image.open(out_path) as img:
-            upscaled[name] = np.asarray(img.convert("RGB")).copy()
+            rgb = img.convert("RGB")
+            if rgb.size != (expected_image_width, expected_image_height):
+                LOGGER.warning(
+                    "SeedVR2 returned %dx%d for %s; resizing to expected %dx%d to preserve face aspect ratio.",
+                    rgb.width,
+                    rgb.height,
+                    name,
+                    expected_image_width,
+                    expected_image_height,
+                )
+                rgb = rgb.resize((expected_image_width, expected_image_height), Image.Resampling.LANCZOS)
+            upscaled[name] = np.asarray(rgb).copy()
 
-    new_face_size = upscaled[next(iter(upscaled))].shape[0]
-    LOGGER.info("SeedVR2 upscale complete. New face size: %dx%d", new_face_size, new_face_size)
-    return upscaled, new_face_size
+    first_upscaled = upscaled[next(iter(upscaled))]
+    new_image_height, new_image_width = first_upscaled.shape[:2]
+    LOGGER.info("SeedVR2 upscale complete. New face size: %dx%d", new_image_width, new_image_height)
+    return upscaled, new_image_width, new_image_height
 
 
 def configure_logging(verbose: bool) -> None:
@@ -655,7 +1016,7 @@ def load_panorama(path: Path) -> np.ndarray:
 
 def load_input_panorama(path: Path) -> np.ndarray:
     panorama = load_panorama(path)
-    return np.ascontiguousarray(panorama[:, ::-1, :])
+    return np.ascontiguousarray(panorama)
 
 
 def validate_equirectangular_shape(image: np.ndarray) -> tuple[int, int]:
@@ -717,13 +1078,43 @@ def resolve_view_fov_degrees(side_count: int, config: dict) -> float:
     return min(170.0, target_fov)
 
 
-def build_extraction_layout(face_size: int, side_count: int, config: dict) -> ExtractionLayout:
+def resolve_cutoff_height_percent(requested: float, config: dict) -> float:
+    if requested not in {None, "", False}:
+        cutoff_percent = float(requested)
+    else:
+        cutoff_percent = float(config.get("default_cutoff_height_percent", 0.0))
+    if not (0.0 <= cutoff_percent <= 40.0):
+        raise ValueError("cutoff_height_percent must be between 0 and 40.")
+    return cutoff_percent
+
+
+def resolve_extraction_image_height(panorama_height: int, cutoff_height_percent: float) -> int:
+    base_height = max(64, int(round(panorama_height)))
+    return max(64, int(round(base_height * (1.0 - (cutoff_height_percent / 100.0)))))
+
+
+def resolve_extraction_focal_y(focal_x_px: float, image_width: int, image_height: int) -> float:
+    # Taller rectangular slices keep the same angular density vertically by scaling fy with the output aspect ratio.
+    return float(focal_x_px) * (float(image_height) / float(max(1, image_width)))
+
+
+def build_extraction_layout(
+    face_size: int,
+    panorama_height: int,
+    side_count: int,
+    cutoff_height_percent: float,
+    config: dict,
+) -> ExtractionLayout:
+    span_degrees = 360.0 / side_count
     view_fov_degrees = resolve_view_fov_degrees(side_count, config)
     if not (45.0 <= view_fov_degrees < 179.0):
         raise ValueError("Resolved view FOV must be between 45 and 179 degrees.")
-    focal_px = (face_size / 2.0) / np.tan(np.deg2rad(view_fov_degrees) / 2.0)
+    image_width = max(face_size, int(round(face_size * (view_fov_degrees / span_degrees))))
+    focal_px = (image_width / 2.0) / np.tan(np.deg2rad(view_fov_degrees) / 2.0)
+    image_height = resolve_extraction_image_height(panorama_height, cutoff_height_percent)
+    focal_y_px = resolve_extraction_focal_y(focal_px, image_width, image_height)
     views = tuple(make_horizon_view(index, side_count) for index in range(side_count))
-    return ExtractionLayout(f"horizon{side_count}", views, focal_px)
+    return ExtractionLayout(f"horizon{side_count}", views, focal_px, focal_y_px, image_width, image_height)
 
 
 def filter_gaussians_by_view_border(
@@ -787,8 +1178,12 @@ def scale_gaussians(gaussians: Gaussians3D, scale_factor: float) -> Gaussians3D:
 def align_gaussians_to_reference(
     gaussians: Gaussians3D,
     reference_disparity_view: np.ndarray,
-    focal_px: float,
-    image_size: int,
+    focal_x_px: float,
+    focal_y_px: float,
+    image_width: int,
+    image_height: int,
+    grid_resolution: int = 8,
+    detail_weight: float = 0.0,
 ) -> tuple[Gaussians3D, float, int]:
     """Align Gaussian depths to DA360 using a smooth low-frequency scale field.
 
@@ -798,16 +1193,19 @@ def align_gaussians_to_reference(
       2. Bin those ratios into a coarse spatial grid and take the
          robust median per cell.
       3. Bilinearly interpolate the coarse grid back to each Gaussian.
+      4. Optionally blend the smooth grid scale with the per-point raw
+         scale according to *detail_weight* (0 = fully smooth, 1 = fully
+         per-point).
 
-    This corrects large-scale depth structure (fixing ground-level alignment
-    between views) while preserving SHARP's high-frequency depth detail
-    (object shapes, surface relief, etc.).
+    *grid_resolution* controls the NxN grid size (higher = finer spatial
+    alignment).  *detail_weight* 0-1 blends smooth vs per-point scales.
 
     Returns ``(aligned_gaussians, median_scale, sample_count)``.
     """
     from sharp.utils.gaussians import Gaussians3D
 
-    grid_cells = 8  # 8x8 spatial bins — controls alignment granularity
+    grid_cells_x = max(1, int(grid_resolution))
+    grid_cells_y = max(1, int(round(grid_cells_x * (image_height / max(1, image_width)))))
 
     mean_vectors = gaussians.mean_vectors  # (1, N, 3)
     mv_np = mean_vectors[0].detach().cpu().numpy().astype(np.float32)
@@ -815,10 +1213,10 @@ def align_gaussians_to_reference(
     radial = np.linalg.norm(mv_np, axis=1)
 
     valid = depth_z > 1e-6
-    pixel_x = (mv_np[:, 0] / np.clip(depth_z, 1e-6, None)) * focal_px + (image_size / 2.0) - 0.5
-    pixel_y = (mv_np[:, 1] / np.clip(depth_z, 1e-6, None)) * focal_px + (image_size / 2.0) - 0.5
-    valid &= (pixel_x >= 0) & (pixel_x <= image_size - 1)
-    valid &= (pixel_y >= 0) & (pixel_y <= image_size - 1)
+    pixel_x = (mv_np[:, 0] / np.clip(depth_z, 1e-6, None)) * focal_x_px + (image_width / 2.0) - 0.5
+    pixel_y = (mv_np[:, 1] / np.clip(depth_z, 1e-6, None)) * focal_y_px + (image_height / 2.0) - 0.5
+    valid &= (pixel_x >= 0) & (pixel_x <= image_width - 1)
+    valid &= (pixel_y >= 0) & (pixel_y <= image_height - 1)
 
     per_point_scale = np.ones(mv_np.shape[0], dtype=np.float32)
     median_scale = 1.0
@@ -848,13 +1246,14 @@ def align_gaussians_to_reference(
             px_ok = pixel_x[valid][ok]
             py_ok = pixel_y[valid][ok]
 
-            cell_size = image_size / grid_cells
-            grid = np.full((grid_cells, grid_cells), median_scale, dtype=np.float32)
-            for gy in range(grid_cells):
-                for gx in range(grid_cells):
+            cell_width = image_width / grid_cells_x
+            cell_height = image_height / grid_cells_y
+            grid = np.full((grid_cells_y, grid_cells_x), median_scale, dtype=np.float32)
+            for gy in range(grid_cells_y):
+                for gx in range(grid_cells_x):
                     in_cell = (
-                        (px_ok >= gx * cell_size) & (px_ok < (gx + 1) * cell_size)
-                        & (py_ok >= gy * cell_size) & (py_ok < (gy + 1) * cell_size)
+                        (px_ok >= gx * cell_width) & (px_ok < (gx + 1) * cell_width)
+                        & (py_ok >= gy * cell_height) & (py_ok < (gy + 1) * cell_height)
                     )
                     if int(in_cell.sum()) >= 8:
                         cell_scales = raw_scale[in_cell]
@@ -874,16 +1273,16 @@ def align_gaussians_to_reference(
             all_px = pixel_x.copy()
             all_py = pixel_y.copy()
             # Clamp for out-of-bounds points (invalid ones get fallback).
-            all_px = np.clip(all_px, 0, image_size - 1)
-            all_py = np.clip(all_py, 0, image_size - 1)
-            gx_cont = all_px / cell_size - 0.5
-            gy_cont = all_py / cell_size - 0.5
+            all_px = np.clip(all_px, 0, image_width - 1)
+            all_py = np.clip(all_py, 0, image_height - 1)
+            gx_cont = all_px / cell_width - 0.5
+            gy_cont = all_py / cell_height - 0.5
 
             # Bilinear interpolation on the coarse grid.
-            gx0 = np.clip(np.floor(gx_cont).astype(np.int32), 0, grid_cells - 1)
-            gy0 = np.clip(np.floor(gy_cont).astype(np.int32), 0, grid_cells - 1)
-            gx1 = np.clip(gx0 + 1, 0, grid_cells - 1)
-            gy1 = np.clip(gy0 + 1, 0, grid_cells - 1)
+            gx0 = np.clip(np.floor(gx_cont).astype(np.int32), 0, grid_cells_x - 1)
+            gy0 = np.clip(np.floor(gy_cont).astype(np.int32), 0, grid_cells_y - 1)
+            gx1 = np.clip(gx0 + 1, 0, grid_cells_x - 1)
+            gy1 = np.clip(gy0 + 1, 0, grid_cells_y - 1)
             wx = np.clip(gx_cont - gx0, 0, 1).astype(np.float32)
             wy = np.clip(gy_cont - gy0, 0, 1).astype(np.float32)
 
@@ -898,7 +1297,16 @@ def align_gaussians_to_reference(
                 + s11 * wx * wy
             )
 
-            per_point_scale = smooth_scale
+            # Blend smooth grid scale with per-point raw scale.
+            dw = float(np.clip(detail_weight, 0.0, 1.0))
+            if dw > 0.0:
+                per_point_raw = np.full(mv_np.shape[0], median_scale, dtype=np.float32)
+                valid_indices = np.where(valid)[0]
+                ok_within_valid = np.where(ok)[0]
+                per_point_raw[valid_indices[ok_within_valid]] = raw_scale
+                per_point_scale = smooth_scale * (1.0 - dw) + per_point_raw * dw
+            else:
+                per_point_scale = smooth_scale
             per_point_scale[~valid] = median_scale
 
     device = mean_vectors.device
@@ -970,13 +1378,17 @@ def bilinear_sample_scalar(image: np.ndarray, sample_x: np.ndarray, sample_y: np
 
 def extract_perspective_view(
     panorama: np.ndarray,
-    image_size: int,
-    focal_px: float,
+    image_width: int,
+    image_height: int,
+    focal_x_px: float,
+    focal_y_px: float,
     view: FaceOrientation,
 ) -> np.ndarray:
-    pixel_coords = np.arange(image_size, dtype=np.float32) + 0.5
-    centered = (pixel_coords - image_size / 2.0) / focal_px
-    grid_x, grid_y = np.meshgrid(centered, centered)
+    pixel_coords_x = np.arange(image_width, dtype=np.float32) + 0.5
+    pixel_coords_y = np.arange(image_height, dtype=np.float32) + 0.5
+    centered_x = (pixel_coords_x - image_width / 2.0) / focal_x_px
+    centered_y = (pixel_coords_y - image_height / 2.0) / focal_y_px
+    grid_x, grid_y = np.meshgrid(centered_x, centered_y)
 
     local_dirs = np.stack((grid_x, grid_y, np.ones_like(grid_x)), axis=-1)
     local_dirs /= np.linalg.norm(local_dirs, axis=-1, keepdims=True)
@@ -996,22 +1408,26 @@ def extract_perspective_view(
     return bilinear_sample(panorama, sample_x, sample_y)
 
 
-def extract_perspective_views(layout: ExtractionLayout, panorama: np.ndarray, image_size: int) -> dict[str, np.ndarray]:
+def extract_perspective_views(layout: ExtractionLayout, panorama: np.ndarray, image_width: int, image_height: int) -> dict[str, np.ndarray]:
     return {
-        view.name: extract_perspective_view(panorama, image_size, layout.focal_px, view)
+        view.name: extract_perspective_view(panorama, image_width, image_height, layout.focal_px, layout.focal_y_px, view)
         for view in layout.views
     }
 
 
 def extract_perspective_scalar_view(
     panorama: np.ndarray,
-    image_size: int,
-    focal_px: float,
+    image_width: int,
+    image_height: int,
+    focal_x_px: float,
+    focal_y_px: float,
     view: FaceOrientation,
 ) -> np.ndarray:
-    pixel_coords = np.arange(image_size, dtype=np.float32) + 0.5
-    centered = (pixel_coords - image_size / 2.0) / focal_px
-    grid_x, grid_y = np.meshgrid(centered, centered)
+    pixel_coords_x = np.arange(image_width, dtype=np.float32) + 0.5
+    pixel_coords_y = np.arange(image_height, dtype=np.float32) + 0.5
+    centered_x = (pixel_coords_x - image_width / 2.0) / focal_x_px
+    centered_y = (pixel_coords_y - image_height / 2.0) / focal_y_px
+    grid_x, grid_y = np.meshgrid(centered_x, centered_y)
 
     local_dirs = np.stack((grid_x, grid_y, np.ones_like(grid_x)), axis=-1)
     local_dirs /= np.linalg.norm(local_dirs, axis=-1, keepdims=True)
@@ -1034,10 +1450,11 @@ def extract_perspective_scalar_view(
 def extract_perspective_scalar_views(
     layout: ExtractionLayout,
     panorama: np.ndarray,
-    image_size: int,
+    image_width: int,
+    image_height: int,
 ) -> dict[str, np.ndarray]:
     return {
-        view.name: extract_perspective_scalar_view(panorama, image_size, layout.focal_px, view)
+        view.name: extract_perspective_scalar_view(panorama, image_width, image_height, layout.focal_px, layout.focal_y_px, view)
         for view in layout.views
     }
 
@@ -1249,12 +1666,19 @@ def save_intermediate_face_images(faces: dict[str, np.ndarray], directory: Path)
         Image.fromarray(image).save(directory / f"{name}.png")
 
 
-def save_intermediate_face_splats(face_gaussians: dict[str, Gaussians3D], focal_px: float, face_size: int, directory: Path) -> None:
+def save_intermediate_face_splats(
+    face_gaussians: dict[str, Gaussians3D],
+    focal_x_px: float,
+    focal_y_px: float,
+    image_width: int,
+    image_height: int,
+    directory: Path,
+) -> None:
     from sharp.utils.gaussians import save_ply
 
     directory.mkdir(parents=True, exist_ok=True)
     for name, gaussians in face_gaussians.items():
-        save_ply(gaussians, focal_px, (face_size, face_size), directory / f"{name}.ply")
+        save_ply(gaussians, (focal_x_px, focal_y_px), (image_width, image_height), directory / f"{name}.ply")
 
 
 def choose_intermediate_dir(args: argparse.Namespace, output_path: Path) -> Path | None:
@@ -1282,177 +1706,810 @@ def cleanup_temp_root(args: argparse.Namespace, temp_root: Path) -> None:
     LOGGER.info("Deleted Temp workspace %s", temp_root)
 
 
-def run_pipeline(args: argparse.Namespace) -> PipelineResult:
-    from sharp.cli.predict import predict_image
-    from sharp.utils.gaussians import apply_transform, save_ply
+def get_cache_root(temp_root: Path) -> Path:
+    return temp_root / "files"
 
-    config = load_config(args.config)
-    output_path, output_format = ensure_output_format(args.output, args.format, config)
-    side_count = resolve_side_count(getattr(args, "side_count", 0), config)
-    da360_alignment_enabled = resolve_da360_alignment_enabled(args, config)
-    da360_checkpoint_path = resolve_da360_checkpoint_path(args, config) if da360_alignment_enabled else None
-    quality = args.quality if args.quality is not None else int(config.get("default_quality", 9))
-    sh_degree = args.sh_degree if args.sh_degree is not None else int(config.get("default_sh_degree", 0))
-    clip_horizontal_raw = config.get("merge_clip_horizontal_degrees", 0)
-    clip_horizontal_degrees = (360.0 / side_count) if clip_horizontal_raw in {None, 0, 0.0, "", False} else float(clip_horizontal_raw)
-    clip_vertical_raw = config.get("merge_clip_vertical_degrees")
-    clip_vertical_degrees = None if clip_vertical_raw in {None, 0, 0.0, "", False} else float(clip_vertical_raw)
-    if not (1 <= quality <= 9):
-        raise ValueError("Quality must be between 1 and 9.")
-    if not (0 <= sh_degree <= 3):
-        raise ValueError("SH degree must be between 0 and 3.")
-    if not (1.0 <= clip_horizontal_degrees <= 180.0):
-        raise ValueError("merge_clip_horizontal_degrees must be between 1 and 180.")
-    if clip_vertical_degrees is not None and not (1.0 <= clip_vertical_degrees <= 180.0):
-        raise ValueError("merge_clip_vertical_degrees must be between 1 and 180 when enabled.")
 
-    device = resolve_device(args.device)
-    LOGGER.info("Using device: %s", device)
+def get_cache_manifest_path(temp_root: Path) -> Path:
+    return get_cache_root(temp_root) / "config.json"
 
-    temp_root = choose_temp_root(args)
-    register_optional_image_plugins()
-    panorama = load_input_panorama(args.input)
-    LOGGER.info("Mirrored panorama horizontally before preprocessing and view extraction.")
-    panorama_width, panorama_height = validate_equirectangular_shape(panorama)
-    seedvr2_upscale_enabled = getattr(args, "enable_seedvr2_upscale", False)
-    imagemagick_optimization_enabled = getattr(args, "enable_imagemagick_optimization", False)
 
-    if imagemagick_optimization_enabled:
-        magick_path = find_imagemagick_executable(getattr(args, "imagemagick", None))
-        if magick_path is None:
-            raise FileNotFoundError("ImageMagick optimization is enabled, but magick.exe was not found. Provide --imagemagick or add ImageMagick to PATH.")
-        imagemagick_commands = resolve_imagemagick_command_tokens(args)
-        if not imagemagick_commands:
-            raise ValueError("ImageMagick optimization is enabled, but no preprocessing operations were selected.")
-        LOGGER.info("Optimizing panorama with ImageMagick before slicing.")
-        panorama = optimize_panorama_with_imagemagick(panorama, temp_root, magick_path, imagemagick_commands)
-        panorama_width, panorama_height = validate_equirectangular_shape(panorama)
-    elif seedvr2_upscale_enabled:
-        LOGGER.info("Applying sharpening to panorama before face extraction.")
-        panorama = sharpen_panorama(panorama)
+def describe_path_for_cache(path_value: Path | None) -> dict[str, Any] | None:
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    resolved = path.resolve() if path.exists() else path.absolute()
+    data: dict[str, Any] = {"path": str(resolved)}
+    if path.exists():
+        stat = path.stat()
+        data["size"] = int(stat.st_size)
+        data["mtime_ns"] = int(stat.st_mtime_ns)
+    return data
 
-    face_size = resolve_face_size(args.face_size, panorama_width, side_count, config)
-    extraction_layout = build_extraction_layout(face_size, side_count, config)
-    focal_px = extraction_layout.focal_px
 
-    LOGGER.info(
-        "Loaded panorama %s with resolution %dx%d. Extracting %d %dx%d perspective views using %s.",
-        args.input,
-        panorama_width,
-        panorama_height,
-        len(extraction_layout.views),
-        face_size,
-        face_size,
-        extraction_layout.name,
-    )
+def read_cache_manifest(temp_root: Path) -> dict[str, Any]:
+    manifest_path = get_cache_manifest_path(temp_root)
+    if not manifest_path.exists():
+        return {}
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    faces = extract_perspective_views(extraction_layout, panorama, face_size)
-    intermediate_dir = choose_intermediate_dir(args, output_path)
-    if intermediate_dir is not None:
-        save_intermediate_face_images(faces, intermediate_dir / "faces")
 
-    if seedvr2_upscale_enabled:
-        original_face_size = face_size
-        faces, face_size = upscale_faces_with_seedvr2(faces, face_size, temp_root)
-        focal_px = extraction_layout.focal_px * (face_size / original_face_size)
-        if intermediate_dir is not None:
-            save_intermediate_face_images(faces, intermediate_dir / "faces_upscaled")
+def write_cache_manifest(temp_root: Path, manifest: Mapping[str, Any]) -> None:
+    manifest_path = get_cache_manifest_path(temp_root)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
 
-    depth_map_path: Path | None = None
-    reference_depth_views: dict[str, np.ndarray] = {}
-    if da360_alignment_enabled:
-        LOGGER.info("Running DA360 panorama depth inference using checkpoint %s", da360_checkpoint_path)
-        da360_predictor = build_da360_predictor(da360_checkpoint_path, device)
-        reference_depth_panorama = predict_da360_disparity_panorama(da360_predictor, panorama, device)
-        reference_depth_views = {
-            view.name: extract_perspective_scalar_view(reference_depth_panorama, face_size, focal_px, view)
-            for view in extraction_layout.views
-        }
-        del da360_predictor
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        depth_map_path = temp_root / "depth" / f"{args.input.stem}_depth.png"
-        save_depth_visualization(reference_depth_panorama, depth_map_path)
-        if intermediate_dir is not None:
-            depth_vis_dir = intermediate_dir / "depth_views"
-            for view_name, depth_view in reference_depth_views.items():
-                save_depth_visualization(depth_view, depth_vis_dir / f"{view_name}_depth.png")
 
-    predictor = build_predictor(args.checkpoint, device)
-    original_median_radii: list[float] = []
-    rotated_face_gaussians: dict[str, Gaussians3D] = {}
-    rotated_gaussian_list: list[Gaussians3D] = []
+def is_cache_step_valid(
+    manifest: Mapping[str, Any],
+    step_name: str,
+    settings: Mapping[str, Any],
+    required_paths: Sequence[Path],
+) -> bool:
+    steps = manifest.get("steps")
+    if not isinstance(steps, dict):
+        return False
+    step = steps.get(step_name)
+    if not isinstance(step, dict):
+        return False
+    if step.get("settings") != dict(settings):
+        return False
+    return all(path.exists() for path in required_paths)
 
-    for view in extraction_layout.views:
-        LOGGER.info("Predicting SHARP splats for view: %s", view.name)
-        gaussians = predict_image(predictor, faces[view.name], focal_px, device)
-        gaussians = filter_gaussians_by_view_border(
-            gaussians,
-            horizontal_border_degrees=clip_horizontal_degrees,
-            vertical_border_degrees=clip_vertical_degrees,
+
+def save_cached_image_array(path: Path, image_array: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(image_array).save(path)
+
+
+def load_cached_image_array(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB")).copy()
+
+
+def save_cached_face_images(faces: Mapping[str, np.ndarray], directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, image in faces.items():
+        Image.fromarray(image).save(directory / f"{name}.png")
+
+
+def load_cached_face_images(view_names: Sequence[str], directory: Path) -> dict[str, np.ndarray]:
+    return {
+        view_name: load_cached_image_array(directory / f"{view_name}.png")
+        for view_name in view_names
+    }
+
+
+def save_cached_depth_arrays(
+    depth_panorama: np.ndarray,
+    depth_views: Mapping[str, np.ndarray],
+    directory: Path,
+) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    np.save(directory / "panorama.npy", depth_panorama)
+    for view_name, depth_view in depth_views.items():
+        np.save(directory / f"{view_name}.npy", depth_view)
+
+
+def load_cached_depth_arrays(
+    view_names: Sequence[str],
+    directory: Path,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    depth_panorama = np.load(directory / "panorama.npy").astype(np.float32)
+    depth_views = {
+        view_name: np.load(directory / f"{view_name}.npy").astype(np.float32)
+        for view_name in view_names
+    }
+    return depth_panorama, depth_views
+
+
+def save_cached_face_gaussians(face_gaussians: Mapping[str, Gaussians3D], directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, gaussians in face_gaussians.items():
+        torch.save(
+            {
+                "mean_vectors": gaussians.mean_vectors.detach().cpu(),
+                "singular_values": gaussians.singular_values.detach().cpu(),
+                "quaternions": gaussians.quaternions.detach().cpu(),
+                "colors": gaussians.colors.detach().cpu(),
+                "opacities": gaussians.opacities.detach().cpu(),
+            },
+            directory / f"{name}.pt",
         )
-        if da360_alignment_enabled:
-            orig_med = float(torch.median(torch.norm(
-                gaussians.mean_vectors, dim=-1,
-            )).item())
-            original_median_radii.append(orig_med)
-            gaussians, median_scale, sample_count = align_gaussians_to_reference(
-                gaussians,
-                reference_depth_views[view.name],
-                focal_px=focal_px,
-                image_size=face_size,
-            )
-            LOGGER.info(
-                "Aligned %s to DA360 depth: median_scale=%.6f "
-                "(%d samples, orig_median_r=%.2f).",
-                view.name, median_scale, sample_count, orig_med,
-            )
-        rotated = apply_transform(gaussians, face_transform_tensor(view, device)).to(torch.device("cpu"))
-        rotated_face_gaussians[view.name] = rotated
-        rotated_gaussian_list.append(rotated)
 
-    if intermediate_dir is not None:
-        save_intermediate_face_splats(rotated_face_gaussians, focal_px, face_size, intermediate_dir / "face_splats")
 
-    merged = merge_gaussians(rotated_gaussian_list)
+def load_cached_face_gaussians(view_names: Sequence[str], directory: Path) -> dict[str, Gaussians3D]:
+    from sharp.utils.gaussians import Gaussians3D
 
-    # After per-view alignment the scene is in DA360's depth units (small).
-    # Apply a uniform global scale so the output matches the original SHARP
-    # magnitude — this does NOT affect inter-view consistency.
-    if da360_alignment_enabled and original_median_radii:
-        original_scene_median = float(np.median(original_median_radii))
-        current_median = float(torch.median(torch.norm(
-            merged.mean_vectors, dim=-1,
-        )).item())
-        if current_median > 1e-8:
-            global_restore = original_scene_median / current_median
-            merged = scale_gaussians(merged, global_restore)
-            LOGGER.info(
-                "Global scene restore: scale=%.4f (%.4f -> %.4f median radius).",
-                global_restore, current_median, original_scene_median,
-            )
+    loaded: dict[str, Gaussians3D] = {}
+    for view_name in view_names:
+        payload_path = directory / f"{view_name}.pt"
+        try:
+            payload = torch.load(payload_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(payload_path, map_location="cpu")
+        loaded[view_name] = Gaussians3D(
+            mean_vectors=payload["mean_vectors"],
+            singular_values=payload["singular_values"],
+            quaternions=payload["quaternions"],
+            colors=payload["colors"],
+            opacities=payload["opacities"],
+        )
+    return loaded
+
+
+def build_output_identity(
+    side_count: int,
+    grid_resolution: int,
+    detail_weight: float,
+    upscale_factor: int,
+) -> dict[str, int]:
+    return {
+        "side_count": int(side_count),
+        "grid_resolution": int(grid_resolution),
+        "detail_preservation": int(round(float(np.clip(detail_weight, 0.0, 1.0)) * 100.0)),
+        "upscale_factor": int(upscale_factor),
+    }
+
+
+def resolve_output_conflict(
+    output_path: Path,
+    alignment_sweep_enabled: bool,
+    previous_output_identity: Mapping[str, Any] | None,
+    current_output_identity: Mapping[str, Any],
+) -> Path:
+    existing_target = output_path.with_suffix("") if alignment_sweep_enabled else output_path
+    if not existing_target.exists() or not isinstance(previous_output_identity, Mapping):
+        return output_path
+
+    suffixes: list[str] = []
+    if previous_output_identity.get("side_count") != current_output_identity.get("side_count"):
+        suffixes.append(f"S{current_output_identity['side_count']}")
+    if previous_output_identity.get("grid_resolution") != current_output_identity.get("grid_resolution"):
+        suffixes.append(f"GR{current_output_identity['grid_resolution']}")
+    if previous_output_identity.get("detail_preservation") != current_output_identity.get("detail_preservation"):
+        suffixes.append(f"DP{current_output_identity['detail_preservation']}")
+    if previous_output_identity.get("upscale_factor") != current_output_identity.get("upscale_factor"):
+        suffixes.append(f"UF{current_output_identity['upscale_factor']}")
+    if not suffixes:
+        return output_path
+
+    return output_path.with_name(f"{output_path.stem}_{'_'.join(suffixes)}{output_path.suffix}")
+
+
+def build_sweep_axis_values(
+    center: int,
+    offsets: Sequence[int],
+    *,
+    min_value: int,
+    max_value: int,
+    fill_step: int,
+    count: int = 5,
+) -> list[int]:
+    center = int(center)
+    values: list[int] = []
+    seen: set[int] = set()
+
+    def add(candidate: int) -> None:
+        candidate = max(min_value, min(max_value, int(candidate)))
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        values.append(candidate)
+
+    for offset in offsets:
+        add(center + offset)
+        if len(values) >= count:
+            return values[:count]
+
+    radius = max(1, fill_step)
+    while len(values) < count and (center - radius >= min_value or center + radius <= max_value):
+        if center - radius >= min_value:
+            add(center - radius)
+            if len(values) >= count:
+                break
+        if center + radius <= max_value:
+            add(center + radius)
+            if len(values) >= count:
+                break
+        radius += max(1, fill_step)
+
+    if len(values) < count:
+        for candidate in range(min_value, max_value + 1):
+            add(candidate)
+            if len(values) >= count:
+                break
+
+    return values[:count]
+
+
+def build_alignment_sweep_combinations(
+    grid_resolution: int,
+    detail_weight: float,
+) -> list[tuple[int, float, int]]:
+    grid_values = build_sweep_axis_values(
+        int(grid_resolution),
+        (-6, -3, 0, 3, 6),
+        min_value=1,
+        max_value=64,
+        fill_step=1,
+    )
+    detail_percent = int(round(float(np.clip(detail_weight, 0.0, 1.0)) * 100.0))
+    detail_values = build_sweep_axis_values(
+        detail_percent,
+        (-20, -10, 0, 20, 30),
+        min_value=0,
+        max_value=100,
+        fill_step=10,
+    )
+    return [
+        (grid_value, detail_value / 100.0, detail_value)
+        for grid_value in grid_values
+        for detail_value in detail_values
+    ]
+
+
+def build_alignment_sweep_output_path(base_output_path: Path, grid_resolution: int, detail_percent: int) -> Path:
+    output_dir = base_output_path.with_suffix("")
+    return output_dir / f"{base_output_path.stem}_GR{grid_resolution}_DP{detail_percent}{base_output_path.suffix}"
+
+
+def write_merged_output(
+    merged: Gaussians3D,
+    output_path: Path,
+    output_format: str,
+    quality: int,
+    sh_degree: int,
+    gsbox_path: Path | None,
+    focal_x_px: float,
+    focal_y_px: float,
+    image_width: int,
+    image_height: int,
+    conversion_dir: Path,
+) -> None:
+    from sharp.utils.gaussians import save_ply
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     if output_format == "ply":
         LOGGER.info("Saving merged PLY to %s", output_path)
-        save_ply(merged, focal_px, (face_size, face_size), output_path)
-        cleanup_temp_root(args, temp_root)
-        return PipelineResult(output_path=output_path, depth_map_path=depth_map_path)
+        save_ply(merged, (focal_x_px, focal_y_px), (image_width, image_height), output_path)
+        LOGGER.info("Wrote merged output to %s", output_path)
+        return
 
-    gsbox_path = find_gsbox(args.gsbox)
     if gsbox_path is None:
         raise FileNotFoundError(
             "Compressed output requires gsbox.exe. Provide --gsbox or place gsbox.exe next to the script."
         )
-
-    conversion_dir = temp_root / "conversion"
     conversion_dir.mkdir(parents=True, exist_ok=True)
     temp_ply = conversion_dir / f"{output_path.stem}.ply"
-    save_ply(merged, focal_px, (face_size, face_size), temp_ply)
+    save_ply(merged, (focal_x_px, focal_y_px), (image_width, image_height), temp_ply)
     convert_with_gsbox(temp_ply, output_path, output_format, quality, sh_degree, gsbox_path)
-    cleanup_temp_root(args, temp_root)
-    return PipelineResult(output_path=output_path, depth_map_path=depth_map_path)
+    LOGGER.info("Wrote merged output to %s", output_path)
+
+
+def run_pipeline(args: argparse.Namespace) -> PipelineResult:
+    from sharp.cli.predict import predict_image
+    from sharp.utils.gaussians import apply_transform
+
+    pipeline_start = time.perf_counter()
+    pipeline_succeeded = False
+    try:
+        with log_timed_step("Resolve pipeline settings"):
+            config = load_config(args.config)
+            output_path, output_format = ensure_output_format(args.output, args.format, config)
+            side_count = resolve_side_count(getattr(args, "side_count", 0), config)
+            cutoff_height_percent = resolve_cutoff_height_percent(getattr(args, "cutoff_height_percent", 0.0), config)
+            da360_alignment_enabled = resolve_da360_alignment_enabled(args, config)
+            alignment_sweep_enabled = bool(getattr(args, "enable_alignment_sweep", False))
+            da360_checkpoint_path = resolve_da360_checkpoint_path(args, config) if da360_alignment_enabled else None
+            quality = args.quality if args.quality is not None else int(config.get("default_quality", 9))
+            sh_degree = args.sh_degree if args.sh_degree is not None else int(config.get("default_sh_degree", 0))
+            clip_horizontal_raw = config.get("merge_clip_horizontal_degrees", 0)
+            clip_horizontal_degrees = (360.0 / side_count) if clip_horizontal_raw in {None, 0, 0.0, "", False} else float(clip_horizontal_raw)
+            clip_vertical_raw = config.get("merge_clip_vertical_degrees")
+            clip_vertical_degrees = None if clip_vertical_raw in {None, 0, 0.0, "", False} else float(clip_vertical_raw)
+            if not (1 <= quality <= 9):
+                raise ValueError("Quality must be between 1 and 9.")
+            if not (0 <= sh_degree <= 3):
+                raise ValueError("SH degree must be between 0 and 3.")
+            if alignment_sweep_enabled and not da360_alignment_enabled:
+                raise ValueError("Alignment sweep mode requires DA360 alignment to be enabled.")
+            if not (1.0 <= clip_horizontal_degrees <= 180.0):
+                raise ValueError("merge_clip_horizontal_degrees must be between 1 and 180.")
+            if clip_vertical_degrees is not None and not (1.0 <= clip_vertical_degrees <= 180.0):
+                raise ValueError("merge_clip_vertical_degrees must be between 1 and 180 when enabled.")
+
+        with log_timed_step("Resolve device"):
+            device = resolve_device(args.device)
+        LOGGER.info("Using device: %s", device)
+        if device.type == "cpu" and torch.cuda.is_available():
+            LOGGER.warning(
+                "SHARP is running on CPU even though CUDA is available on %s. "
+                "Set Device to 'default' or 'cuda' in the GUI to restore GPU inference speed.",
+                torch.cuda.get_device_name(0),
+            )
+
+        temp_root = choose_temp_root(args)
+        cache_root = get_cache_root(temp_root)
+        previous_manifest = read_cache_manifest(temp_root)
+        step_manifests: dict[str, dict[str, Any]] = {}
+        seedvr2_upscale_enabled = getattr(args, "enable_seedvr2_upscale", False)
+        imagemagick_optimization_enabled = getattr(args, "enable_imagemagick_optimization", False)
+        deblur_preprocessing_enabled = bool(getattr(args, "enable_deblur_preprocessing", False))
+        deblur_strength = normalize_deblur_strength(getattr(args, "deblur_strength", "medium"))
+        seedvr2_settings = load_seedvr2_settings() if seedvr2_upscale_enabled else None
+        upscale_factor = int(seedvr2_settings.get("resolution_factor", 2)) if seedvr2_settings is not None else 1
+        current_output_identity = build_output_identity(
+            side_count,
+            getattr(args, "alignment_grid_resolution", 8),
+            getattr(args, "alignment_detail_weight", 0.0),
+            upscale_factor,
+        )
+        resolved_output_path = resolve_output_conflict(
+            output_path,
+            alignment_sweep_enabled,
+            previous_manifest.get("output_identity") if isinstance(previous_manifest, dict) else None,
+            current_output_identity,
+        )
+        if resolved_output_path != output_path:
+            LOGGER.info("Output already exists; writing this run to %s", resolved_output_path)
+            output_path = resolved_output_path
+
+        input_signature = describe_path_for_cache(args.input)
+        imagemagick_commands = resolve_imagemagick_command_tokens(args) if imagemagick_optimization_enabled else []
+        processed_panorama_path = cache_root / "processed_panorama.png"
+        preprocess_settings = {
+            "input": input_signature,
+            "horizontal_mirror": False,
+            "imagemagick_enabled": bool(imagemagick_optimization_enabled),
+            "imagemagick_commands": list(imagemagick_commands),
+            "seedvr2_sharpen_only": bool(seedvr2_upscale_enabled and not imagemagick_optimization_enabled),
+        }
+
+        with log_timed_step("Load and validate panorama"):
+            if imagemagick_optimization_enabled and not imagemagick_commands:
+                raise ValueError("ImageMagick optimization is enabled, but no preprocessing operations were selected.")
+            if is_cache_step_valid(previous_manifest, "preprocess", preprocess_settings, [processed_panorama_path]):
+                panorama = load_cached_image_array(processed_panorama_path)
+                LOGGER.info("Reusing cached processed panorama from %s", processed_panorama_path)
+            else:
+                register_optional_image_plugins()
+                panorama = load_input_panorama(args.input)
+                if imagemagick_optimization_enabled:
+                    magick_path = find_imagemagick_executable(getattr(args, "imagemagick", None))
+                    if magick_path is None:
+                        raise FileNotFoundError("ImageMagick optimization is enabled, but magick.exe was not found. Provide --imagemagick or add ImageMagick to PATH.")
+                    LOGGER.info("Optimizing panorama with ImageMagick before slicing.")
+                    panorama = optimize_panorama_with_imagemagick(panorama, temp_root, magick_path, imagemagick_commands)
+                elif seedvr2_upscale_enabled:
+                    LOGGER.info("Applying sharpening to panorama before face extraction.")
+                    panorama = sharpen_panorama(panorama)
+                save_cached_image_array(processed_panorama_path, panorama)
+            panorama_width, panorama_height = validate_equirectangular_shape(panorama)
+        step_manifests["preprocess"] = {"settings": preprocess_settings}
+
+        with log_timed_step("Build extraction layout"):
+            face_size = resolve_face_size(args.face_size, panorama_width, side_count, config)
+            extraction_layout = build_extraction_layout(face_size, panorama_height, side_count, cutoff_height_percent, config)
+            focal_px = extraction_layout.focal_px
+            focal_y_px = extraction_layout.focal_y_px
+            image_width = extraction_layout.image_width
+            image_height = extraction_layout.image_height
+
+        LOGGER.info(
+            "Loaded panorama %s with resolution %dx%d. Extracting %d %dx%d perspective views using %s.",
+            args.input,
+            panorama_width,
+            panorama_height,
+            len(extraction_layout.views),
+            image_width,
+            image_height,
+            extraction_layout.name,
+        )
+
+        view_names = [view.name for view in extraction_layout.views]
+        faces_cache_dir = cache_root / "faces"
+        faces_settings = {
+            "preprocess": preprocess_settings,
+            "config": describe_path_for_cache(args.config),
+            "side_count": int(side_count),
+            "cutoff_height_percent": round(float(cutoff_height_percent), 4),
+            "requested_face_size": int(args.face_size),
+            "resolved_face_width": int(image_width),
+            "resolved_face_height": int(image_height),
+            "layout": extraction_layout.name,
+        }
+        with log_timed_step("Extract perspective views"):
+            required_face_paths = [faces_cache_dir / f"{view_name}.png" for view_name in view_names]
+            if is_cache_step_valid(previous_manifest, "faces", faces_settings, required_face_paths):
+                faces = load_cached_face_images(view_names, faces_cache_dir)
+                LOGGER.info("Reusing cached extracted faces from %s", faces_cache_dir)
+            else:
+                faces = extract_perspective_views(extraction_layout, panorama, image_width, image_height)
+                save_cached_face_images(faces, faces_cache_dir)
+        step_manifests["faces"] = {"settings": faces_settings}
+
+        intermediate_dir = choose_intermediate_dir(args, output_path)
+        if intermediate_dir is not None:
+            with log_timed_step("Save extracted face images"):
+                save_intermediate_face_images(faces, intermediate_dir / "faces")
+
+        if deblur_preprocessing_enabled:
+            deblur_step_settings = {
+                "enabled": True,
+                "strength": deblur_strength,
+                "input_face_width": int(image_width),
+                "input_face_height": int(image_height),
+                "view_names": list(view_names),
+            }
+            deblurred_faces_cache_dir = cache_root / "faces_deblurred"
+            with log_timed_step("Deblur extracted faces"):
+                required_deblurred_paths = [deblurred_faces_cache_dir / f"{view_name}.png" for view_name in view_names]
+                if is_cache_step_valid(previous_manifest, "deblur", deblur_step_settings, required_deblurred_paths):
+                    faces = load_cached_face_images(view_names, deblurred_faces_cache_dir)
+                    LOGGER.info("Reusing cached deblurred faces from %s", deblurred_faces_cache_dir)
+                else:
+                    faces = deblur_faces_with_motion_rl(faces, deblur_strength)
+                    save_cached_face_images(faces, deblurred_faces_cache_dir)
+            step_manifests["deblur"] = {"settings": deblur_step_settings}
+            if intermediate_dir is not None:
+                with log_timed_step("Save deblurred face images"):
+                    save_intermediate_face_images(faces, intermediate_dir / "faces_deblurred")
+        else:
+            step_manifests["deblur"] = {"settings": {"enabled": False}}
+
+        if seedvr2_upscale_enabled:
+            expected_upscaled_width, expected_upscaled_height = image_width, image_height
+            seedvr2_input_width, seedvr2_input_height, seedvr2_stretch_applied = image_width, image_height, False
+            if seedvr2_settings is not None:
+                seedvr2_input_width, seedvr2_input_height, seedvr2_stretch_applied = resolve_seedvr2_stretch_dimensions(
+                    image_width,
+                    image_height,
+                    seedvr2_settings,
+                )
+                _, expected_upscaled_width, expected_upscaled_height = resolve_seedvr2_target_dimensions(
+                    seedvr2_input_width,
+                    seedvr2_input_height,
+                    seedvr2_settings,
+                )
+            seedvr2_step_settings = {
+                "enabled": True,
+                "settings": seedvr2_settings,
+                "deblur": step_manifests["deblur"]["settings"],
+                "input_face_width": int(image_width),
+                "input_face_height": int(image_height),
+                "seedvr2_input_face_width": int(seedvr2_input_width),
+                "seedvr2_input_face_height": int(seedvr2_input_height),
+                "stretch_applied": bool(seedvr2_stretch_applied),
+                "expected_output_face_width": int(expected_upscaled_width),
+                "expected_output_face_height": int(expected_upscaled_height),
+                "view_names": list(view_names),
+            }
+            upscaled_faces_cache_dir = cache_root / "faces_upscaled"
+            with log_timed_step("Upscale faces with SeedVR2"):
+                original_face_width = image_width
+                required_upscaled_paths = [upscaled_faces_cache_dir / f"{view_name}.png" for view_name in view_names]
+                if is_cache_step_valid(previous_manifest, "seedvr2", seedvr2_step_settings, required_upscaled_paths):
+                    faces = load_cached_face_images(view_names, upscaled_faces_cache_dir)
+                    image_height, image_width = faces[view_names[0]].shape[:2]
+                    LOGGER.info("Reusing cached SeedVR2 upscaled faces from %s", upscaled_faces_cache_dir)
+                else:
+                    faces, image_width, image_height = upscale_faces_with_seedvr2(faces, image_width, image_height, temp_root)
+                    save_cached_face_images(faces, upscaled_faces_cache_dir)
+                focal_px = extraction_layout.focal_px * (image_width / original_face_width)
+                focal_y_px = extraction_layout.focal_y_px * (image_height / max(1, extraction_layout.image_height))
+            step_manifests["seedvr2"] = {"settings": seedvr2_step_settings}
+            if intermediate_dir is not None:
+                with log_timed_step("Save upscaled face images"):
+                    save_intermediate_face_images(faces, intermediate_dir / "faces_upscaled")
+        else:
+            step_manifests["seedvr2"] = {"settings": {"enabled": False}}
+
+        depth_map_path: Path | None = None
+        reference_depth_panorama: np.ndarray | None = None
+        reference_depth_views: dict[str, np.ndarray] = {}
+        if da360_alignment_enabled:
+            grid_res = getattr(args, "alignment_grid_resolution", 8)
+            detail_wt = getattr(args, "alignment_detail_weight", 0.0)
+            depth_cache_dir = cache_root / "depth"
+            da360_step_settings = {
+                "enabled": True,
+                "preprocess": preprocess_settings,
+                "checkpoint": describe_path_for_cache(da360_checkpoint_path),
+                "resolved_face_width": int(image_width),
+                "resolved_face_height": int(image_height),
+                "focal_x_px": round(float(focal_px), 6),
+                "focal_y_px": round(float(focal_y_px), 6),
+                "view_names": list(view_names),
+            }
+            with log_timed_step("Run DA360 depth inference"):
+                required_depth_paths = [depth_cache_dir / "panorama.npy", *[depth_cache_dir / f"{view_name}.npy" for view_name in view_names]]
+                if is_cache_step_valid(previous_manifest, "da360", da360_step_settings, required_depth_paths):
+                    reference_depth_panorama, reference_depth_views = load_cached_depth_arrays(view_names, depth_cache_dir)
+                    LOGGER.info("Reusing cached DA360 depth from %s", depth_cache_dir)
+                else:
+                    LOGGER.info(
+                        "Running DA360 panorama depth inference using checkpoint %s "
+                        "(grid=%dx%d, detail=%.0f%%)",
+                        da360_checkpoint_path, grid_res, grid_res, detail_wt * 100,
+                    )
+                    da360_predictor = build_da360_predictor(da360_checkpoint_path, device)
+                    reference_depth_panorama = predict_da360_disparity_panorama(da360_predictor, panorama, device)
+                    reference_depth_views = {
+                        view.name: extract_perspective_scalar_view(reference_depth_panorama, image_width, image_height, focal_px, focal_y_px, view)
+                        for view in extraction_layout.views
+                    }
+                    save_cached_depth_arrays(reference_depth_panorama, reference_depth_views, depth_cache_dir)
+                    del da360_predictor
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+            step_manifests["da360"] = {"settings": da360_step_settings}
+            depth_map_path = temp_root / "depth" / f"{args.input.stem}_depth.png"
+            with log_timed_step("Save DA360 depth visualizations"):
+                save_depth_visualization(reference_depth_panorama, depth_map_path)
+                if intermediate_dir is not None:
+                    depth_vis_dir = intermediate_dir / "depth_views"
+                    for view_name, depth_view in reference_depth_views.items():
+                        save_depth_visualization(depth_view, depth_vis_dir / f"{view_name}_depth.png")
+        else:
+            step_manifests["da360"] = {"settings": {"enabled": False}}
+
+        prepared_face_gaussians: dict[str, Gaussians3D]
+        sharp_cache_dir = cache_root / "prepared_gaussians"
+        sharp_step_settings = {
+            "checkpoint": describe_path_for_cache(args.checkpoint) or {"default_model_url": DEFAULT_MODEL_URL},
+            "config": describe_path_for_cache(args.config),
+            "view_names": list(view_names),
+            "resolved_face_width": int(image_width),
+            "resolved_face_height": int(image_height),
+            "focal_x_px": round(float(focal_px), 6),
+            "focal_y_px": round(float(focal_y_px), 6),
+            "clip_horizontal_degrees": round(float(clip_horizontal_degrees), 6),
+            "clip_vertical_degrees": None if clip_vertical_degrees is None else round(float(clip_vertical_degrees), 6),
+            "deblur": step_manifests["deblur"]["settings"],
+            "seedvr2": step_manifests["seedvr2"]["settings"],
+        }
+        required_sharp_paths = [sharp_cache_dir / f"{view_name}.pt" for view_name in view_names]
+        if is_cache_step_valid(previous_manifest, "sharp", sharp_step_settings, required_sharp_paths):
+            with log_timed_step("Load cached SHARP face gaussians"):
+                prepared_face_gaussians = load_cached_face_gaussians(view_names, sharp_cache_dir)
+                LOGGER.info("Reusing cached SHARP face gaussians from %s", sharp_cache_dir)
+        else:
+            with log_timed_step("Build SHARP predictor"):
+                predictor = build_predictor(args.checkpoint, device)
+
+            prepared_face_gaussians = {}
+            for view in extraction_layout.views:
+                with log_timed_step(f"Predict SHARP splats for view {view.name}"):
+                    LOGGER.info("Predicting SHARP splats for view: %s", view.name)
+                    gaussians = predict_image(predictor, faces[view.name], (focal_px, focal_y_px), device)
+                with log_timed_step(f"Filter Gaussians for view {view.name}"):
+                    gaussians = filter_gaussians_by_view_border(
+                        gaussians,
+                        horizontal_border_degrees=clip_horizontal_degrees,
+                        vertical_border_degrees=clip_vertical_degrees,
+                    )
+                prepared_face_gaussians[view.name] = gaussians.to(torch.device("cpu"))
+
+            save_cached_face_gaussians(prepared_face_gaussians, sharp_cache_dir)
+            del predictor
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        step_manifests["sharp"] = {"settings": sharp_step_settings}
+
+        if intermediate_dir is not None:
+            with log_timed_step("Save raw per-face SHARP splats"):
+                save_intermediate_face_splats(
+                    prepared_face_gaussians,
+                    focal_px,
+                    focal_y_px,
+                    image_width,
+                    image_height,
+                    intermediate_dir / "face_splats",
+                )
+
+        original_median_radii: list[float] = []
+        if da360_alignment_enabled:
+            for view_name in view_names:
+                original_median_radii.append(float(torch.median(torch.norm(
+                    prepared_face_gaussians[view_name].mean_vectors, dim=-1,
+                )).item()))
+
+        face_transforms = {
+            view.name: face_transform_tensor(view, device)
+            for view in extraction_layout.views
+        }
+
+        gsbox_path: Path | None = None
+        if output_format != "ply":
+            with log_timed_step("Resolve gsbox for compressed output"):
+                gsbox_path = find_gsbox(args.gsbox)
+                if gsbox_path is None:
+                    raise FileNotFoundError(
+                        "Compressed output requires gsbox.exe. Provide --gsbox or place gsbox.exe next to the script."
+                    )
+
+        generated_outputs: list[Path] = []
+        display_path: Path | None = None
+        original_scene_median = float(np.median(original_median_radii)) if original_median_radii else 0.0
+
+        if alignment_sweep_enabled:
+            sweep_combinations = build_alignment_sweep_combinations(
+                getattr(args, "alignment_grid_resolution", 8),
+                getattr(args, "alignment_detail_weight", 0.0),
+            )
+            display_path = output_path.with_suffix("")
+            with log_timed_step("Prepare alignment sweep output directory"):
+                display_path.mkdir(parents=True, exist_ok=True)
+            grid_values = sorted({grid for grid, _weight, _percent in sweep_combinations})
+            detail_values = sorted({percent for _grid, _weight, percent in sweep_combinations})
+            LOGGER.info(
+                "Alignment sweep mode: %d variants. Grid values=%s Detail values=%s%%. Output directory: %s",
+                len(sweep_combinations),
+                ", ".join(str(value) for value in grid_values),
+                ", ".join(str(value) for value in detail_values),
+                display_path,
+            )
+
+            for grid_resolution, detail_weight, detail_percent in sweep_combinations:
+                combo_name = f"GR{grid_resolution}_DP{detail_percent}"
+                variant_output_path = build_alignment_sweep_output_path(output_path, grid_resolution, detail_percent)
+                with log_timed_step(f"Build merged splat {combo_name}"):
+                    rotated_gaussian_list: list[Gaussians3D] = []
+                    for view in extraction_layout.views:
+                        gaussians = prepared_face_gaussians[view.name].to(device)
+                        gaussians, median_scale, sample_count = align_gaussians_to_reference(
+                            gaussians,
+                            reference_depth_views[view.name],
+                            focal_x_px=focal_px,
+                            focal_y_px=focal_y_px,
+                            image_width=image_width,
+                            image_height=image_height,
+                            grid_resolution=grid_resolution,
+                            detail_weight=detail_weight,
+                        )
+                        LOGGER.info(
+                            "Aligned %s for %s: median_scale=%.6f (%d samples).",
+                            view.name, combo_name, median_scale, sample_count,
+                        )
+                        rotated = apply_transform(gaussians, face_transforms[view.name]).to(torch.device("cpu"))
+                        rotated_gaussian_list.append(rotated)
+
+                    merged = merge_gaussians(rotated_gaussian_list)
+                    if original_median_radii:
+                        current_median = float(torch.median(torch.norm(
+                            merged.mean_vectors, dim=-1,
+                        )).item())
+                        if current_median > 1e-8:
+                            global_restore = original_scene_median / current_median
+                            merged = scale_gaussians(merged, global_restore)
+                            LOGGER.info(
+                                "Global scene restore for %s: scale=%.4f (%.4f -> %.4f median radius).",
+                                combo_name, global_restore, current_median, original_scene_median,
+                            )
+
+                with log_timed_step(f"Write output {combo_name}"):
+                    write_merged_output(
+                        merged,
+                        variant_output_path,
+                        output_format,
+                        quality,
+                        sh_degree,
+                        gsbox_path,
+                        focal_px,
+                        focal_y_px,
+                        image_width,
+                        image_height,
+                        temp_root / "conversion",
+                    )
+                generated_outputs.append(variant_output_path)
+        else:
+            rotated_face_gaussians: dict[str, Gaussians3D] = {}
+            rotated_gaussian_list: list[Gaussians3D] = []
+            for view in extraction_layout.views:
+                gaussians = prepared_face_gaussians[view.name].to(device)
+                if da360_alignment_enabled:
+                    with log_timed_step(f"Align view {view.name} to DA360 depth"):
+                        orig_med = float(torch.median(torch.norm(
+                            gaussians.mean_vectors, dim=-1,
+                        )).item())
+                        gaussians, median_scale, sample_count = align_gaussians_to_reference(
+                            gaussians,
+                            reference_depth_views[view.name],
+                            focal_x_px=focal_px,
+                            focal_y_px=focal_y_px,
+                            image_width=image_width,
+                            image_height=image_height,
+                            grid_resolution=getattr(args, "alignment_grid_resolution", 8),
+                            detail_weight=getattr(args, "alignment_detail_weight", 0.0),
+                        )
+                        LOGGER.info(
+                            "Aligned %s to DA360 depth: median_scale=%.6f "
+                            "(%d samples, orig_median_r=%.2f).",
+                            view.name, median_scale, sample_count, orig_med,
+                        )
+                with log_timed_step(f"Rotate view {view.name} into world frame"):
+                    rotated = apply_transform(gaussians, face_transforms[view.name]).to(torch.device("cpu"))
+                rotated_face_gaussians[view.name] = rotated
+                rotated_gaussian_list.append(rotated)
+
+            if intermediate_dir is not None:
+                with log_timed_step("Save world-space face splats"):
+                    save_intermediate_face_splats(
+                        rotated_face_gaussians,
+                        focal_px,
+                        focal_y_px,
+                        image_width,
+                        image_height,
+                        intermediate_dir / "face_splats_world",
+                    )
+
+            with log_timed_step("Merge rotated face splats"):
+                merged = merge_gaussians(rotated_gaussian_list)
+
+            if da360_alignment_enabled and original_median_radii:
+                with log_timed_step("Restore global scene scale"):
+                    current_median = float(torch.median(torch.norm(
+                        merged.mean_vectors, dim=-1,
+                    )).item())
+                    if current_median > 1e-8:
+                        global_restore = original_scene_median / current_median
+                        merged = scale_gaussians(merged, global_restore)
+                        LOGGER.info(
+                            "Global scene restore: scale=%.4f (%.4f -> %.4f median radius).",
+                            global_restore, current_median, original_scene_median,
+                        )
+
+            with log_timed_step("Write merged output"):
+                write_merged_output(
+                    merged,
+                    output_path,
+                    output_format,
+                    quality,
+                    sh_degree,
+                    gsbox_path,
+                    focal_px,
+                    focal_y_px,
+                    image_width,
+                    image_height,
+                    temp_root / "conversion",
+                )
+            generated_outputs.append(output_path)
+
+        with log_timed_step("Write temp cache manifest"):
+            write_cache_manifest(
+                temp_root,
+                {
+                    "version": 1,
+                    "input": input_signature,
+                    "steps": step_manifests,
+                    "output_identity": current_output_identity,
+                    "generated_outputs": [str(path) for path in generated_outputs],
+                    "display_path": str(display_path) if display_path is not None else None,
+                },
+            )
+
+        with log_timed_step("Clean up temporary workspace"):
+            cleanup_temp_root(args, temp_root)
+        pipeline_succeeded = True
+        return PipelineResult(
+            output_path=output_path,
+            depth_map_path=depth_map_path,
+            generated_outputs=generated_outputs,
+            display_path=display_path,
+        )
+    finally:
+        total_elapsed = time.perf_counter() - pipeline_start
+        if pipeline_succeeded:
+            LOGGER.info("Whole pipeline completed in %s", format_duration(total_elapsed))
+        else:
+            LOGGER.info("Whole pipeline aborted after %s", format_duration(total_elapsed))
 
 
 def main() -> int:
@@ -1465,7 +2522,10 @@ def main() -> int:
         if args.verbose:
             raise
         return 1
-    LOGGER.info("Wrote merged output to %s", result.output_path)
+    if result.generated_outputs and len(result.generated_outputs) > 1:
+        LOGGER.info("Wrote %d merged outputs to %s", len(result.generated_outputs), result.display_path or result.output_path)
+    else:
+        LOGGER.info("Wrote merged output to %s", result.output_path)
     return 0
 
 

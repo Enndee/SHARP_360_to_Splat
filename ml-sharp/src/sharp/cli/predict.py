@@ -159,7 +159,7 @@ def predict_cli(
 def predict_image(
     predictor: RGBGaussianPredictor,
     image: np.ndarray,
-    f_px: float,
+    f_px: float | tuple[float, float],
     device: torch.device,
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
@@ -168,7 +168,12 @@ def predict_image(
     LOGGER.info("Running preprocessing.")
     image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
-    disparity_factor = torch.tensor([f_px / width]).float().to(device)
+    if isinstance(f_px, tuple):
+        focal_x_px, focal_y_px = float(f_px[0]), float(f_px[1])
+    else:
+        focal_x_px = float(f_px)
+        focal_y_px = float(f_px)
+    disparity_factor = torch.tensor([focal_x_px / width]).float().to(device)
 
     image_resized_pt = F.interpolate(
         image_pt[None],
@@ -185,8 +190,8 @@ def predict_image(
     intrinsics = (
         torch.tensor(
             [
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
+                [focal_x_px, 0, width / 2, 0],
+                [0, focal_y_px, height / 2, 0],
                 [0, 0, 1, 0],
                 [0, 0, 0, 1],
             ]

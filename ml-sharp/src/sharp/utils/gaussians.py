@@ -341,7 +341,7 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
 
 @torch.no_grad()
 def save_ply(
-    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path
+    gaussians: Gaussians3D, f_px: float | tuple[float, float], image_shape: tuple[int, int], path: Path
 ) -> PlyData:
     """Save a predicted Gaussian3D to a ply file."""
 
@@ -399,6 +399,11 @@ def save_ply(
 
     # Load image-wise metadata.
     image_height, image_width = image_shape
+    if isinstance(f_px, tuple):
+        focal_x_px, focal_y_px = float(f_px[0]), float(f_px[1])
+    else:
+        focal_x_px = float(f_px)
+        focal_y_px = float(f_px)
 
     # Export image size.
     dtype_image_size = [("image_size", "u4")]
@@ -411,11 +416,11 @@ def save_ply(
     intrinsic_array = np.empty(9, dtype=dtype_intrinsic)
     intrinsic = np.array(
         [
-            f_px,
+            focal_x_px,
             0,
             image_width * 0.5,
             0,
-            f_px,
+            focal_y_px,
             image_height * 0.5,
             0,
             0,
