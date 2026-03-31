@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from contextvars import ContextVar
 import importlib
 import json
 import logging
@@ -13,7 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -117,6 +118,13 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger("insp_to_splat")
+SUPPORTED_ALIGNMENT_MODES = ("none", "da360", "overlap")
+OVERLAP_ALIGNMENT_YAW_BINS = 12
+OVERLAP_ALIGNMENT_PITCH_BINS = 10
+OVERLAP_ALIGNMENT_MIN_BIN_POINTS = 4
+OVERLAP_ALIGNMENT_MIN_SHARED_BINS = 6
+OVERLAP_DEPTH_LAYER_BINS = 6
+OVERLAP_DEPTH_LAYER_MIN_SAMPLES = 16
 
 
 def format_duration(seconds: float) -> str:
@@ -131,15 +139,57 @@ def format_duration(seconds: float) -> str:
     return f"{int(hours)}h {int(minutes)}m {remaining:.1f}s"
 
 
+@dataclass(frozen=True)
+class StepTiming:
+    name: str
+    duration_seconds: float
+    depth: int
+    succeeded: bool
+
+
+CURRENT_STEP_TIMINGS: ContextVar[list[StepTiming] | None] = ContextVar("current_step_timings", default=None)
+CURRENT_STEP_TIMING_DEPTH: ContextVar[int] = ContextVar("current_step_timing_depth", default=0)
+
+
+def log_step_timing_summary(step_timings: Sequence[StepTiming], total_elapsed: float) -> None:
+    top_level_steps = [step for step in step_timings if step.depth == 0]
+    if not top_level_steps:
+        return
+
+    LOGGER.info("Step timing summary (top-level steps, slowest first):")
+    LOGGER.info("  %9s  %6s  %s", "Duration", "Share", "Step")
+    for step in sorted(top_level_steps, key=lambda item: item.duration_seconds, reverse=True):
+        share = (step.duration_seconds / total_elapsed * 100.0) if total_elapsed > 1e-9 else 0.0
+        status_suffix = "" if step.succeeded else " [failed]"
+        LOGGER.info("  %9s  %5.1f%%  %s%s", format_duration(step.duration_seconds), share, step.name, status_suffix)
+
+    timed_total = sum(step.duration_seconds for step in top_level_steps)
+    overhead = max(0.0, total_elapsed - timed_total)
+    overhead_share = (overhead / total_elapsed * 100.0) if total_elapsed > 1e-9 else 0.0
+    LOGGER.info("  %9s  %5.1f%%  %s", format_duration(overhead), overhead_share, "Untimed / overhead")
+
+
 @contextmanager
-def log_timed_step(step_name: str) -> Iterable[None]:
+def log_timed_step(step_name: str) -> Iterator[None]:
+    step_timings = CURRENT_STEP_TIMINGS.get()
+    depth = CURRENT_STEP_TIMING_DEPTH.get()
+    depth_token = CURRENT_STEP_TIMING_DEPTH.set(depth + 1)
     start = time.perf_counter()
     try:
         yield
     except Exception:
-        LOGGER.info("Step failed: %s after %s", step_name, format_duration(time.perf_counter() - start))
+        elapsed = time.perf_counter() - start
+        if step_timings is not None:
+            step_timings.append(StepTiming(step_name, elapsed, depth, False))
+        LOGGER.info("Step failed: %s after %s", step_name, format_duration(elapsed))
         raise
-    LOGGER.info("Step complete: %s in %s", step_name, format_duration(time.perf_counter() - start))
+    else:
+        elapsed = time.perf_counter() - start
+        if step_timings is not None:
+            step_timings.append(StepTiming(step_name, elapsed, depth, True))
+        LOGGER.info("Step complete: %s in %s", step_name, format_duration(elapsed))
+    finally:
+        CURRENT_STEP_TIMING_DEPTH.reset(depth_token)
 
 
 @dataclass(frozen=True)
@@ -162,6 +212,24 @@ class ExtractionLayout:
     focal_y_px: float
     image_width: int
     image_height: int
+
+
+@dataclass(frozen=True)
+class OverlapBoundaryField:
+    boundary_yaw_deg: float
+    half_overlap_degrees: float
+    yaw_edges: np.ndarray
+    pitch_edges: np.ndarray
+    log_scale_grid: np.ndarray
+    fallback_log_scale: float
+    peer_name: str
+
+
+@dataclass(frozen=True)
+class DepthLayerCurve:
+    log_radius_knots: np.ndarray
+    log_scale_knots: np.ndarray
+    fallback_log_scale: float
 
 
 @dataclass(frozen=True)
@@ -247,6 +315,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional DA360 checkpoint path. Defaults to checkpoints/DA360_large.pth.",
+    )
+    parser.add_argument(
+        "--alignment-mode",
+        choices=SUPPORTED_ALIGNMENT_MODES,
+        default=None,
+        help="Slice alignment mode: none, da360, or overlap.",
     )
     parser.add_argument(
         "--disable-da360-alignment",
@@ -923,9 +997,10 @@ def load_torch_checkpoint(path: Path) -> dict:
 
 
 def resolve_optional_path(path_value: str | Path | None) -> Path | None:
-    if path_value in {None, "", False}:
+    if path_value is None or path_value == "" or path_value is False:
         return None
-    path = Path(path_value)
+    path_input: str | Path = path_value if isinstance(path_value, Path) else str(path_value)
+    path = Path(path_input)
     if not path.is_absolute():
         path = ROOT_DIR / path
     return path
@@ -938,6 +1013,39 @@ def resolve_da360_alignment_enabled(args: argparse.Namespace, config: dict) -> b
     if getattr(args, "disable_da360_alignment", False):
         return False
     return bool(config.get("default_enable_da360_alignment", True))
+
+
+def normalize_alignment_mode(mode: str | None) -> str:
+    normalized = str(mode or "").strip().lower()
+    if not normalized:
+        return "da360"
+    aliases = {
+        "off": "none",
+        "disabled": "none",
+        "false": "none",
+        "depth": "da360",
+        "da360_depth": "da360",
+        "overlap_scale": "overlap",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in SUPPORTED_ALIGNMENT_MODES:
+        raise ValueError(f"Unsupported alignment mode: {mode}")
+    return normalized
+
+
+def resolve_alignment_mode(args: argparse.Namespace, config: dict) -> str:
+    explicit_mode = getattr(args, "alignment_mode", None)
+    if explicit_mode not in {None, ""}:
+        return normalize_alignment_mode(explicit_mode)
+    explicit_legacy = getattr(args, "enable_da360_alignment", None)
+    if explicit_legacy is not None:
+        return "da360" if bool(explicit_legacy) else "none"
+    if getattr(args, "disable_da360_alignment", False):
+        return "none"
+    config_mode = config.get("default_alignment_mode")
+    if config_mode not in {None, ""}:
+        return normalize_alignment_mode(config_mode)
+    return "da360" if bool(config.get("default_enable_da360_alignment", True)) else "none"
 
 
 def resolve_da360_checkpoint_path(args: argparse.Namespace, config: dict) -> Path:
@@ -1173,6 +1281,744 @@ def scale_gaussians(gaussians: Gaussians3D, scale_factor: float) -> Gaussians3D:
         colors=gaussians.colors,
         opacities=gaussians.opacities,
     )
+
+
+def apply_per_point_scales(gaussians: Gaussians3D, per_point_scale: np.ndarray) -> Gaussians3D:
+    from sharp.utils.gaussians import Gaussians3D
+
+    scale_values = np.asarray(per_point_scale, dtype=np.float32).reshape(-1)
+    if scale_values.shape[0] != int(gaussians.mean_vectors.shape[1]):
+        raise ValueError("Per-point scale count does not match the Gaussian count.")
+    scale_t = torch.from_numpy(scale_values).to(device=gaussians.mean_vectors.device, dtype=gaussians.mean_vectors.dtype).unsqueeze(0).unsqueeze(-1)
+    return Gaussians3D(
+        mean_vectors=gaussians.mean_vectors * scale_t,
+        singular_values=gaussians.singular_values * scale_t,
+        quaternions=gaussians.quaternions,
+        colors=gaussians.colors,
+        opacities=gaussians.opacities,
+    )
+
+
+def wrap_angle_degrees(angle_degrees: np.ndarray | float) -> np.ndarray | float:
+    return (np.asarray(angle_degrees) + 180.0) % 360.0 - 180.0
+
+
+def compute_face_world_polar_arrays(
+    gaussians: Gaussians3D,
+    view: FaceOrientation,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    mean_vectors = gaussians.mean_vectors[0].detach().cpu().numpy().astype(np.float32)
+    world_vectors = mean_vectors @ view.rotation_matrix.T
+    radial = np.linalg.norm(world_vectors, axis=1)
+    horizontal = np.linalg.norm(world_vectors[:, (0, 2)], axis=1)
+    yaw_deg = np.rad2deg(np.arctan2(world_vectors[:, 0], world_vectors[:, 2])).astype(np.float32)
+    pitch_deg = np.rad2deg(np.arctan2(world_vectors[:, 1], np.clip(horizontal, 1e-6, None))).astype(np.float32)
+    valid = np.isfinite(radial) & (radial > 1e-6) & np.isfinite(yaw_deg) & np.isfinite(pitch_deg)
+    return yaw_deg, pitch_deg, radial.astype(np.float32), valid
+
+
+def compute_face_world_polar_stats(
+    gaussians: Gaussians3D,
+    view: FaceOrientation,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    yaw_deg, pitch_deg, radial, valid = compute_face_world_polar_arrays(gaussians, view)
+    return yaw_deg[valid], pitch_deg[valid], radial[valid]
+
+
+def smooth_overlap_grid(grid: np.ndarray, passes: int = 1) -> np.ndarray:
+    result = np.asarray(grid, dtype=np.float32)
+    for _ in range(max(0, int(passes))):
+        padded = np.pad(result, ((1, 1), (1, 1)), mode="edge")
+        result = (
+            padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:]
+            + padded[1:-1, :-2] + padded[1:-1, 1:-1] + padded[1:-1, 2:]
+            + padded[2:, :-2] + padded[2:, 1:-1] + padded[2:, 2:]
+        ).astype(np.float32) / 9.0
+    return result
+
+
+def compute_overlap_pair_bins(
+    left_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    right_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    boundary_yaw_deg: float,
+    overlap_degrees: float,
+    yaw_bin_count: int = OVERLAP_ALIGNMENT_YAW_BINS,
+    pitch_bin_count: int = OVERLAP_ALIGNMENT_PITCH_BINS,
+    min_points_per_bin: int = OVERLAP_ALIGNMENT_MIN_BIN_POINTS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    half_overlap = overlap_degrees / 2.0
+    left_yaw, left_pitch, left_radial = left_stats
+    right_yaw, right_pitch, right_radial = right_stats
+    left_delta = np.asarray(wrap_angle_degrees(left_yaw - boundary_yaw_deg), dtype=np.float32)
+    right_delta = np.asarray(wrap_angle_degrees(right_yaw - boundary_yaw_deg), dtype=np.float32)
+    left_keep = np.abs(left_delta) <= half_overlap
+    right_keep = np.abs(right_delta) <= half_overlap
+    if int(np.count_nonzero(left_keep)) < min_points_per_bin or int(np.count_nonzero(right_keep)) < min_points_per_bin:
+        return None
+
+    left_delta = left_delta[left_keep]
+    right_delta = right_delta[right_keep]
+    left_pitch = np.asarray(left_pitch[left_keep], dtype=np.float32)
+    right_pitch = np.asarray(right_pitch[right_keep], dtype=np.float32)
+    left_radial = np.asarray(left_radial[left_keep], dtype=np.float32)
+    right_radial = np.asarray(right_radial[right_keep], dtype=np.float32)
+    combined_pitch = np.concatenate((left_pitch, right_pitch))
+    if combined_pitch.size == 0:
+        return None
+    pitch_low, pitch_high = np.quantile(combined_pitch, [0.05, 0.95])
+    if float(pitch_high - pitch_low) < 1e-3:
+        pitch_low = float(np.min(combined_pitch)) - 0.5
+        pitch_high = float(np.max(combined_pitch)) + 0.5
+
+    yaw_edges = np.linspace(-half_overlap, half_overlap, yaw_bin_count + 1, dtype=np.float32)
+    pitch_edges = np.linspace(float(pitch_low), float(pitch_high), pitch_bin_count + 1, dtype=np.float32)
+    left_medians, left_counts = build_overlap_bin_medians(left_delta, left_pitch, left_radial, yaw_edges, pitch_edges, min_points_per_bin)
+    right_medians, right_counts = build_overlap_bin_medians(right_delta, right_pitch, right_radial, yaw_edges, pitch_edges, min_points_per_bin)
+    return left_medians, left_counts, right_medians, right_counts, yaw_edges, pitch_edges
+
+
+def compute_clipped_edge_pair_bins(
+    left_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    right_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    boundary_yaw_deg: float,
+    edge_width_degrees: float,
+    yaw_bin_count: int = OVERLAP_ALIGNMENT_YAW_BINS,
+    pitch_bin_count: int = OVERLAP_ALIGNMENT_PITCH_BINS,
+    min_points_per_bin: int = OVERLAP_ALIGNMENT_MIN_BIN_POINTS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    left_yaw, left_pitch, left_radial = left_stats
+    right_yaw, right_pitch, right_radial = right_stats
+    left_delta = np.asarray(wrap_angle_degrees(left_yaw - boundary_yaw_deg), dtype=np.float32)
+    right_delta = np.asarray(wrap_angle_degrees(right_yaw - boundary_yaw_deg), dtype=np.float32)
+    left_keep = (left_delta >= -edge_width_degrees) & (left_delta <= 0.0)
+    right_keep = (right_delta >= 0.0) & (right_delta <= edge_width_degrees)
+    if int(np.count_nonzero(left_keep)) < min_points_per_bin or int(np.count_nonzero(right_keep)) < min_points_per_bin:
+        return None
+
+    left_edge_distance = np.asarray(-left_delta[left_keep], dtype=np.float32)
+    right_edge_distance = np.asarray(right_delta[right_keep], dtype=np.float32)
+    left_pitch = np.asarray(left_pitch[left_keep], dtype=np.float32)
+    right_pitch = np.asarray(right_pitch[right_keep], dtype=np.float32)
+    left_radial = np.asarray(left_radial[left_keep], dtype=np.float32)
+    right_radial = np.asarray(right_radial[right_keep], dtype=np.float32)
+    combined_pitch = np.concatenate((left_pitch, right_pitch))
+    if combined_pitch.size == 0:
+        return None
+    pitch_low, pitch_high = np.quantile(combined_pitch, [0.05, 0.95])
+    if float(pitch_high - pitch_low) < 1e-3:
+        pitch_low = float(np.min(combined_pitch)) - 0.5
+        pitch_high = float(np.max(combined_pitch)) + 0.5
+
+    yaw_edges = np.linspace(0.0, edge_width_degrees, yaw_bin_count + 1, dtype=np.float32)
+    pitch_edges = np.linspace(float(pitch_low), float(pitch_high), pitch_bin_count + 1, dtype=np.float32)
+    left_medians, left_counts = build_overlap_bin_medians(left_edge_distance, left_pitch, left_radial, yaw_edges, pitch_edges, min_points_per_bin)
+    right_medians, right_counts = build_overlap_bin_medians(right_edge_distance, right_pitch, right_radial, yaw_edges, pitch_edges, min_points_per_bin)
+    return left_medians, left_counts, right_medians, right_counts, yaw_edges, pitch_edges
+
+
+def build_overlap_bin_medians(
+    yaw_delta_deg: np.ndarray,
+    pitch_deg: np.ndarray,
+    radial: np.ndarray,
+    yaw_edges: np.ndarray,
+    pitch_edges: np.ndarray,
+    min_points_per_bin: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    yaw_bin_count = len(yaw_edges) - 1
+    pitch_bin_count = len(pitch_edges) - 1
+    medians = np.full((pitch_bin_count, yaw_bin_count), np.nan, dtype=np.float32)
+    counts = np.zeros((pitch_bin_count, yaw_bin_count), dtype=np.int32)
+    yaw_indices = np.digitize(yaw_delta_deg, yaw_edges) - 1
+    pitch_indices = np.digitize(pitch_deg, pitch_edges) - 1
+    valid = (
+        (yaw_indices >= 0) & (yaw_indices < yaw_bin_count)
+        & (pitch_indices >= 0) & (pitch_indices < pitch_bin_count)
+        & np.isfinite(radial) & (radial > 1e-6)
+    )
+    if not np.any(valid):
+        return medians, counts
+
+    flat_indices = pitch_indices[valid] * yaw_bin_count + yaw_indices[valid]
+    flat_values = radial[valid]
+    for flat_index in np.unique(flat_indices):
+        cell_values = flat_values[flat_indices == flat_index]
+        pitch_index = int(flat_index // yaw_bin_count)
+        yaw_index = int(flat_index % yaw_bin_count)
+        counts[pitch_index, yaw_index] = int(cell_values.size)
+        if cell_values.size >= min_points_per_bin:
+            medians[pitch_index, yaw_index] = float(np.median(cell_values))
+    return medians, counts
+
+
+def estimate_overlap_pair_scale_ratio(
+    left_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    right_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    boundary_yaw_deg: float,
+    overlap_degrees: float,
+    yaw_bin_count: int = OVERLAP_ALIGNMENT_YAW_BINS,
+    pitch_bin_count: int = OVERLAP_ALIGNMENT_PITCH_BINS,
+    min_points_per_bin: int = OVERLAP_ALIGNMENT_MIN_BIN_POINTS,
+    min_shared_bins: int = OVERLAP_ALIGNMENT_MIN_SHARED_BINS,
+) -> tuple[float, int] | None:
+    pair_bins = compute_overlap_pair_bins(
+        left_stats,
+        right_stats,
+        boundary_yaw_deg,
+        overlap_degrees,
+        yaw_bin_count=yaw_bin_count,
+        pitch_bin_count=pitch_bin_count,
+        min_points_per_bin=min_points_per_bin,
+    )
+    if pair_bins is None:
+        return None
+    left_medians, left_counts, right_medians, right_counts, _yaw_edges, _pitch_edges = pair_bins
+    shared = np.isfinite(left_medians) & np.isfinite(right_medians)
+    shared_count = int(shared.sum())
+    if shared_count < min_shared_bins:
+        return None
+
+    ratios = np.clip(left_medians[shared] / np.maximum(right_medians[shared], 1e-6), 1e-6, None)
+    log_ratios = np.log(ratios.astype(np.float64))
+    weights = np.minimum(left_counts[shared], right_counts[shared]).astype(np.float64)
+    if log_ratios.size >= 6:
+        low, high = np.quantile(log_ratios, [0.1, 0.9])
+        trimmed = (log_ratios >= low) & (log_ratios <= high)
+        if np.any(trimmed):
+            log_ratios = log_ratios[trimmed]
+            weights = weights[trimmed]
+    if log_ratios.size == 0:
+        return None
+    log_ratio = weighted_median(log_ratios.astype(np.float32), np.maximum(weights, 1e-3).astype(np.float32))
+    return float(np.exp(log_ratio)), shared_count
+
+
+def build_overlap_pair_boundary_fields(
+    left_name: str,
+    right_name: str,
+    left_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    right_stats: tuple[np.ndarray, np.ndarray, np.ndarray],
+    boundary_yaw_deg: float,
+    overlap_degrees: float,
+    left_global_scale: float,
+    right_global_scale: float,
+    yaw_bin_count: int = OVERLAP_ALIGNMENT_YAW_BINS,
+    pitch_bin_count: int = OVERLAP_ALIGNMENT_PITCH_BINS,
+    min_points_per_bin: int = OVERLAP_ALIGNMENT_MIN_BIN_POINTS,
+    min_shared_bins: int = OVERLAP_ALIGNMENT_MIN_SHARED_BINS,
+) -> tuple[OverlapBoundaryField, OverlapBoundaryField, float, int] | None:
+    pair_bins = compute_overlap_pair_bins(
+        left_stats,
+        right_stats,
+        boundary_yaw_deg,
+        overlap_degrees,
+        yaw_bin_count=yaw_bin_count,
+        pitch_bin_count=pitch_bin_count,
+        min_points_per_bin=min_points_per_bin,
+    )
+    if pair_bins is None:
+        return None
+    left_medians, left_counts, right_medians, right_counts, yaw_edges, pitch_edges = pair_bins
+    return build_boundary_fields_from_pair_bins(
+        left_name,
+        right_name,
+        left_medians,
+        left_counts,
+        right_medians,
+        right_counts,
+        yaw_edges,
+        pitch_edges,
+        overlap_degrees / 2.0,
+        boundary_yaw_deg,
+        left_global_scale,
+        right_global_scale,
+        min_shared_bins=min_shared_bins,
+    )
+
+
+def build_boundary_fields_from_pair_bins(
+    left_name: str,
+    right_name: str,
+    left_medians: np.ndarray,
+    left_counts: np.ndarray,
+    right_medians: np.ndarray,
+    right_counts: np.ndarray,
+    yaw_edges: np.ndarray,
+    pitch_edges: np.ndarray,
+    half_overlap: float,
+    boundary_yaw_deg: float,
+    left_global_scale: float,
+    right_global_scale: float,
+    min_shared_bins: int = OVERLAP_ALIGNMENT_MIN_SHARED_BINS,
+) -> tuple[OverlapBoundaryField, OverlapBoundaryField, float, int] | None:
+    shared = np.isfinite(left_medians) & np.isfinite(right_medians)
+    shared_count = int(shared.sum())
+    if shared_count < min_shared_bins:
+        return None
+
+    scaled_left = left_medians * float(left_global_scale)
+    scaled_right = right_medians * float(right_global_scale)
+    shared_log_ratios = np.log(np.clip(scaled_left[shared] / np.maximum(scaled_right[shared], 1e-6), 1e-6, None).astype(np.float64))
+    weights = np.minimum(left_counts[shared], right_counts[shared]).astype(np.float64)
+    trimmed_log_ratios = shared_log_ratios
+    trimmed_weights = weights
+    if shared_log_ratios.size >= 6:
+        low, high = np.quantile(shared_log_ratios, [0.1, 0.9])
+        trimmed = (shared_log_ratios >= low) & (shared_log_ratios <= high)
+        if np.any(trimmed):
+            trimmed_log_ratios = shared_log_ratios[trimmed]
+            trimmed_weights = weights[trimmed]
+    if trimmed_log_ratios.size == 0:
+        return None
+
+    fallback_log_ratio = weighted_median(
+        trimmed_log_ratios.astype(np.float32),
+        np.maximum(trimmed_weights, 1e-3).astype(np.float32),
+    )
+    ratio_log_grid = np.full_like(left_medians, fallback_log_ratio, dtype=np.float32)
+    ratio_log_grid[shared] = shared_log_ratios.astype(np.float32)
+    ratio_log_grid = np.clip(smooth_overlap_grid(ratio_log_grid, passes=1), np.log(0.25), np.log(4.0))
+
+    left_log_grid = -0.5 * ratio_log_grid
+    right_log_grid = 0.5 * ratio_log_grid
+    return (
+        OverlapBoundaryField(boundary_yaw_deg, half_overlap, yaw_edges, pitch_edges, left_log_grid, float(-0.5 * fallback_log_ratio), right_name),
+        OverlapBoundaryField(boundary_yaw_deg, half_overlap, yaw_edges, pitch_edges, right_log_grid, float(0.5 * fallback_log_ratio), left_name),
+        float(np.exp(fallback_log_ratio)),
+        shared_count,
+    )
+
+
+def solve_overlap_alignment_scales(
+    face_count: int,
+    constraints: Sequence[tuple[int, int, float, int]],
+) -> np.ndarray:
+    if face_count <= 0:
+        return np.ones(0, dtype=np.float32)
+    if not constraints:
+        return np.ones(face_count, dtype=np.float32)
+
+    rows: list[np.ndarray] = []
+    rhs: list[float] = []
+    for left_index, right_index, ratio, weight in constraints:
+        row = np.zeros(face_count, dtype=np.float64)
+        scaled_weight = float(np.sqrt(max(1.0, float(weight))))
+        row[left_index] = -scaled_weight
+        row[right_index] = scaled_weight
+        rows.append(row)
+        rhs.append(np.log(max(ratio, 1e-6)) * scaled_weight)
+    rows.append(np.ones(face_count, dtype=np.float64))
+    rhs.append(0.0)
+    solution, *_ = np.linalg.lstsq(np.vstack(rows), np.asarray(rhs, dtype=np.float64), rcond=None)
+    solution -= float(np.mean(solution))
+    return np.exp(solution).astype(np.float32)
+
+
+def resolve_overlap_alignment_scales(
+    face_gaussians: Mapping[str, Gaussians3D],
+    layout: ExtractionLayout,
+    config: Mapping[str, Any],
+) -> tuple[dict[str, float], list[tuple[str, str, float, int]]]:
+    side_count = max(1, len(layout.views))
+    if side_count == 1:
+        return {layout.views[0].name: 1.0}, []
+
+    span_degrees = 360.0 / side_count
+    overlap_degrees = max(0.0, resolve_view_fov_degrees(side_count, dict(config)) - span_degrees)
+    if overlap_degrees <= 0.25:
+        LOGGER.warning("Overlap alignment requested, but the configured overlap is too small (%.2f deg).", overlap_degrees)
+        return {view.name: 1.0 for view in layout.views}, []
+
+    polar_stats = {
+        view.name: compute_face_world_polar_stats(face_gaussians[view.name], view)
+        for view in layout.views
+    }
+    constraints: list[tuple[int, int, float, int]] = []
+    diagnostics: list[tuple[str, str, float, int]] = []
+    for index, view in enumerate(layout.views):
+        next_index = (index + 1) % side_count
+        next_view = layout.views[next_index]
+        center_yaw_deg = float(np.rad2deg(np.arctan2(view.forward[0], view.forward[2])))
+        boundary_yaw_deg = float(wrap_angle_degrees(center_yaw_deg + (span_degrees / 2.0)))
+        estimate = estimate_overlap_pair_scale_ratio(
+            polar_stats[view.name],
+            polar_stats[next_view.name],
+            boundary_yaw_deg,
+            overlap_degrees,
+        )
+        if estimate is None:
+            LOGGER.warning("Overlap alignment could not derive a reliable constraint between %s and %s.", view.name, next_view.name)
+            continue
+        ratio, shared_bins = estimate
+        constraints.append((index, next_index, ratio, shared_bins))
+        diagnostics.append((view.name, next_view.name, ratio, shared_bins))
+
+    scales = solve_overlap_alignment_scales(side_count, constraints)
+    return {view.name: float(scales[index]) for index, view in enumerate(layout.views)}, diagnostics
+
+
+def resolve_overlap_alignment_fields(
+    face_gaussians: Mapping[str, Gaussians3D],
+    layout: ExtractionLayout,
+    config: Mapping[str, Any],
+    global_scales: Mapping[str, float],
+) -> tuple[dict[str, dict[str, OverlapBoundaryField]], list[tuple[str, str, float, int]]]:
+    boundary_fields = {view.name: {} for view in layout.views}
+    side_count = max(1, len(layout.views))
+    if side_count == 1:
+        return boundary_fields, []
+
+    span_degrees = 360.0 / side_count
+    overlap_degrees = max(0.0, resolve_view_fov_degrees(side_count, dict(config)) - span_degrees)
+    if overlap_degrees <= 0.25:
+        return boundary_fields, []
+
+    polar_stats = {
+        view.name: compute_face_world_polar_stats(face_gaussians[view.name], view)
+        for view in layout.views
+    }
+    diagnostics: list[tuple[str, str, float, int]] = []
+    for index, view in enumerate(layout.views):
+        next_index = (index + 1) % side_count
+        next_view = layout.views[next_index]
+        center_yaw_deg = float(np.rad2deg(np.arctan2(view.forward[0], view.forward[2])))
+        boundary_yaw_deg = float(wrap_angle_degrees(center_yaw_deg + (span_degrees / 2.0)))
+        pair_fields = build_overlap_pair_boundary_fields(
+            view.name,
+            next_view.name,
+            polar_stats[view.name],
+            polar_stats[next_view.name],
+            boundary_yaw_deg,
+            overlap_degrees,
+            float(global_scales.get(view.name, 1.0)),
+            float(global_scales.get(next_view.name, 1.0)),
+        )
+        if pair_fields is None:
+            LOGGER.warning("Overlap seam field could not derive a reliable local correction between %s and %s.", view.name, next_view.name)
+            continue
+        left_field, right_field, residual_ratio, shared_bins = pair_fields
+        boundary_fields[view.name]["right"] = left_field
+        boundary_fields[next_view.name]["left"] = right_field
+        diagnostics.append((view.name, next_view.name, residual_ratio, shared_bins))
+    return boundary_fields, diagnostics
+
+
+def resolve_clipped_edge_alignment_fields(
+    face_gaussians: Mapping[str, Gaussians3D],
+    layout: ExtractionLayout,
+    config: Mapping[str, Any],
+    global_scales: Mapping[str, float],
+) -> tuple[dict[str, dict[str, OverlapBoundaryField]], list[tuple[str, str, float, int]]]:
+    boundary_fields = {view.name: {} for view in layout.views}
+    side_count = max(1, len(layout.views))
+    if side_count == 1:
+        return boundary_fields, []
+
+    span_degrees = 360.0 / side_count
+    edge_width_degrees = max(0.0, (resolve_view_fov_degrees(side_count, dict(config)) - span_degrees) / 2.0)
+    if edge_width_degrees <= 0.125:
+        return boundary_fields, []
+
+    polar_stats = {
+        view.name: compute_face_world_polar_stats(face_gaussians[view.name], view)
+        for view in layout.views
+    }
+    diagnostics: list[tuple[str, str, float, int]] = []
+    for index, view in enumerate(layout.views):
+        next_index = (index + 1) % side_count
+        next_view = layout.views[next_index]
+        center_yaw_deg = float(np.rad2deg(np.arctan2(view.forward[0], view.forward[2])))
+        boundary_yaw_deg = float(wrap_angle_degrees(center_yaw_deg + (span_degrees / 2.0)))
+        pair_bins = compute_clipped_edge_pair_bins(
+            polar_stats[view.name],
+            polar_stats[next_view.name],
+            boundary_yaw_deg,
+            edge_width_degrees,
+        )
+        if pair_bins is None:
+            LOGGER.warning("Clipped-edge refinement could not derive a reliable local correction between %s and %s.", view.name, next_view.name)
+            continue
+        left_medians, left_counts, right_medians, right_counts, yaw_edges, pitch_edges = pair_bins
+        pair_fields = build_boundary_fields_from_pair_bins(
+            view.name,
+            next_view.name,
+            left_medians,
+            left_counts,
+            right_medians,
+            right_counts,
+            yaw_edges,
+            pitch_edges,
+            edge_width_degrees,
+            boundary_yaw_deg,
+            float(global_scales.get(view.name, 1.0)),
+            float(global_scales.get(next_view.name, 1.0)),
+        )
+        if pair_fields is None:
+            LOGGER.warning("Clipped-edge refinement rejected sparse correction data between %s and %s.", view.name, next_view.name)
+            continue
+        left_field, right_field, residual_ratio, shared_bins = pair_fields
+        boundary_fields[view.name]["right"] = left_field
+        boundary_fields[next_view.name]["left"] = right_field
+        diagnostics.append((view.name, next_view.name, residual_ratio, shared_bins))
+    return boundary_fields, diagnostics
+
+
+def sample_overlap_boundary_field(
+    field: OverlapBoundaryField,
+    yaw_delta_deg: np.ndarray,
+    pitch_deg: np.ndarray,
+) -> np.ndarray:
+    yaw_cell_width = float(field.yaw_edges[-1] - field.yaw_edges[0]) / float(max(1, len(field.yaw_edges) - 1))
+    pitch_cell_width = float(field.pitch_edges[-1] - field.pitch_edges[0]) / float(max(1, len(field.pitch_edges) - 1))
+    yaw_cont = (np.asarray(yaw_delta_deg, dtype=np.float32) - float(field.yaw_edges[0])) / max(yaw_cell_width, 1e-6) - 0.5
+    pitch_cont = (np.asarray(pitch_deg, dtype=np.float32) - float(field.pitch_edges[0])) / max(pitch_cell_width, 1e-6) - 0.5
+
+    grid_height, grid_width = field.log_scale_grid.shape
+    x0 = np.clip(np.floor(yaw_cont).astype(np.int32), 0, grid_width - 1)
+    y0 = np.clip(np.floor(pitch_cont).astype(np.int32), 0, grid_height - 1)
+    x1 = np.clip(x0 + 1, 0, grid_width - 1)
+    y1 = np.clip(y0 + 1, 0, grid_height - 1)
+    wx = np.clip(yaw_cont - x0, 0.0, 1.0).astype(np.float32)
+    wy = np.clip(pitch_cont - y0, 0.0, 1.0).astype(np.float32)
+
+    s00 = field.log_scale_grid[y0, x0]
+    s01 = field.log_scale_grid[y0, x1]
+    s10 = field.log_scale_grid[y1, x0]
+    s11 = field.log_scale_grid[y1, x1]
+    return (
+        s00 * (1.0 - wx) * (1.0 - wy)
+        + s01 * wx * (1.0 - wy)
+        + s10 * (1.0 - wx) * wy
+        + s11 * wx * wy
+    ).astype(np.float32)
+
+
+def apply_overlap_alignment_fields(
+    gaussians: Gaussians3D,
+    view: FaceOrientation,
+    boundary_fields: Mapping[str, OverlapBoundaryField],
+) -> tuple[Gaussians3D, int]:
+    if not boundary_fields:
+        return gaussians, 0
+
+    yaw_deg, pitch_deg, _radial, valid = compute_face_world_polar_arrays(gaussians, view)
+    point_count = yaw_deg.shape[0]
+    log_scale_sum = np.zeros(point_count, dtype=np.float32)
+    weight_sum = np.zeros(point_count, dtype=np.float32)
+    touched_mask = np.zeros(point_count, dtype=bool)
+
+    for field in boundary_fields.values():
+        yaw_delta = np.asarray(wrap_angle_degrees(yaw_deg - field.boundary_yaw_deg), dtype=np.float32)
+        seam_mask = valid & np.isfinite(yaw_delta) & np.isfinite(pitch_deg) & (np.abs(yaw_delta) <= field.half_overlap_degrees)
+        if not np.any(seam_mask):
+            continue
+        sampled_log_scale = sample_overlap_boundary_field(field, yaw_delta[seam_mask], pitch_deg[seam_mask])
+        seam_weight = np.clip(1.0 - (np.abs(yaw_delta[seam_mask]) / max(field.half_overlap_degrees, 1e-6)), 0.0, 1.0).astype(np.float32)
+        seam_weight = np.maximum(seam_weight * seam_weight, 1e-3)
+        log_scale_sum[seam_mask] += sampled_log_scale * seam_weight
+        weight_sum[seam_mask] += 1.0
+        touched_mask[seam_mask] = True
+
+    if not np.any(touched_mask):
+        return gaussians, 0
+
+    per_point_scale = np.ones(point_count, dtype=np.float32)
+    per_point_scale[touched_mask] = np.exp(np.clip(log_scale_sum[touched_mask] / np.maximum(weight_sum[touched_mask], 1e-6), np.log(0.25), np.log(4.0)))
+    per_point_scale = np.clip(per_point_scale, 0.25, 4.0)
+    return apply_per_point_scales(gaussians, per_point_scale), int(touched_mask.sum())
+
+
+def apply_overlap_global_and_local_alignment(
+    gaussians: Gaussians3D,
+    view: FaceOrientation,
+    global_scale: float,
+    boundary_fields: Mapping[str, OverlapBoundaryField],
+) -> tuple[Gaussians3D, int]:
+    gaussians = scale_gaussians(gaussians, global_scale)
+    return apply_overlap_alignment_fields(gaussians, view, boundary_fields)
+
+
+def smooth_curve_values(values: np.ndarray, passes: int = 1) -> np.ndarray:
+    result = np.asarray(values, dtype=np.float32)
+    for _ in range(max(0, int(passes))):
+        padded = np.pad(result, (1, 1), mode="edge")
+        result = (padded[:-2] + 2.0 * padded[1:-1] + padded[2:]).astype(np.float32) / 4.0
+    return result
+
+
+def build_depth_layer_standardization_curve(
+    log_radius_samples: np.ndarray,
+    log_scale_samples: np.ndarray,
+    weights: np.ndarray,
+    bin_count: int = OVERLAP_DEPTH_LAYER_BINS,
+    min_samples_per_bin: int = OVERLAP_DEPTH_LAYER_MIN_SAMPLES,
+) -> DepthLayerCurve | None:
+    if log_radius_samples.size < min_samples_per_bin or log_scale_samples.size != log_radius_samples.size:
+        return None
+
+    sample_weights = np.maximum(np.asarray(weights, dtype=np.float32).reshape(-1), 1e-3)
+    log_radius_samples = np.asarray(log_radius_samples, dtype=np.float32).reshape(-1)
+    log_scale_samples = np.asarray(log_scale_samples, dtype=np.float32).reshape(-1)
+    radius_low, radius_high = np.quantile(log_radius_samples, [0.05, 0.95])
+    if not np.isfinite(radius_low) or not np.isfinite(radius_high) or float(radius_high - radius_low) < 1e-3:
+        return None
+
+    edges = np.linspace(float(radius_low), float(radius_high), max(2, int(bin_count)) + 1, dtype=np.float32)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    baseline = weighted_median(log_scale_samples, sample_weights)
+    knot_values = np.full(centers.shape, np.nan, dtype=np.float32)
+    for index in range(centers.shape[0]):
+        if index == centers.shape[0] - 1:
+            in_bin = (log_radius_samples >= edges[index]) & (log_radius_samples <= edges[index + 1])
+        else:
+            in_bin = (log_radius_samples >= edges[index]) & (log_radius_samples < edges[index + 1])
+        if int(in_bin.sum()) < min_samples_per_bin:
+            continue
+        knot_values[index] = weighted_median(log_scale_samples[in_bin], sample_weights[in_bin]) - baseline
+
+    known = np.isfinite(knot_values)
+    if not np.any(known):
+        return None
+    if int(known.sum()) == 1:
+        knot_values[:] = float(knot_values[known][0])
+    else:
+        knot_values = np.interp(centers, centers[known], knot_values[known]).astype(np.float32)
+    knot_values = np.clip(smooth_curve_values(knot_values, passes=1), np.log(0.5), np.log(2.0))
+    return DepthLayerCurve(centers.astype(np.float32), knot_values.astype(np.float32), 0.0)
+
+
+def sample_depth_layer_curve(curve: DepthLayerCurve, log_radius: np.ndarray) -> np.ndarray:
+    return np.interp(
+        np.asarray(log_radius, dtype=np.float32),
+        curve.log_radius_knots,
+        curve.log_scale_knots,
+        left=float(curve.log_scale_knots[0]),
+        right=float(curve.log_scale_knots[-1]),
+    ).astype(np.float32)
+
+
+def resolve_overlap_depth_layer_standardization(
+    face_gaussians: Mapping[str, Gaussians3D],
+    layout: ExtractionLayout,
+    config: Mapping[str, Any],
+) -> tuple[dict[str, DepthLayerCurve | None], list[tuple[str, int, float]]]:
+    curves: dict[str, DepthLayerCurve | None] = {view.name: None for view in layout.views}
+    diagnostics: list[tuple[str, int, float]] = []
+    side_count = max(1, len(layout.views))
+    if side_count == 1:
+        return curves, diagnostics
+
+    span_degrees = 360.0 / side_count
+    edge_width_degrees = max(0.0, (resolve_view_fov_degrees(side_count, dict(config)) - span_degrees) / 2.0)
+    if edge_width_degrees <= 0.125:
+        return curves, diagnostics
+
+    polar_stats = {
+        view.name: compute_face_world_polar_stats(face_gaussians[view.name], view)
+        for view in layout.views
+    }
+    per_face_log_radius: dict[str, list[np.ndarray]] = {view.name: [] for view in layout.views}
+    per_face_log_scale: dict[str, list[np.ndarray]] = {view.name: [] for view in layout.views}
+    per_face_weights: dict[str, list[np.ndarray]] = {view.name: [] for view in layout.views}
+
+    for index, view in enumerate(layout.views):
+        next_index = (index + 1) % side_count
+        next_view = layout.views[next_index]
+        center_yaw_deg = float(np.rad2deg(np.arctan2(view.forward[0], view.forward[2])))
+        boundary_yaw_deg = float(wrap_angle_degrees(center_yaw_deg + (span_degrees / 2.0)))
+        pair_bins = compute_clipped_edge_pair_bins(
+            polar_stats[view.name],
+            polar_stats[next_view.name],
+            boundary_yaw_deg,
+            edge_width_degrees,
+        )
+        if pair_bins is None:
+            continue
+        left_medians, left_counts, right_medians, right_counts, _yaw_edges, _pitch_edges = pair_bins
+        shared = np.isfinite(left_medians) & np.isfinite(right_medians)
+        if int(shared.sum()) < OVERLAP_ALIGNMENT_MIN_SHARED_BINS:
+            continue
+
+        left_shared = np.clip(left_medians[shared], 1e-6, None).astype(np.float32)
+        right_shared = np.clip(right_medians[shared], 1e-6, None).astype(np.float32)
+        weight_shared = np.minimum(left_counts[shared], right_counts[shared]).astype(np.float32)
+        log_ratio = np.log(np.clip(left_shared / right_shared, 1e-6, None).astype(np.float64))
+        if log_ratio.size >= 6:
+            low, high = np.quantile(log_ratio, [0.1, 0.9])
+            trimmed = (log_ratio >= low) & (log_ratio <= high)
+            if np.any(trimmed):
+                left_shared = left_shared[trimmed]
+                right_shared = right_shared[trimmed]
+                weight_shared = weight_shared[trimmed]
+                log_ratio = log_ratio[trimmed]
+        if log_ratio.size == 0:
+            continue
+
+        per_face_log_radius[view.name].append(np.log(left_shared).astype(np.float32))
+        per_face_log_scale[view.name].append((-0.5 * log_ratio).astype(np.float32))
+        per_face_weights[view.name].append(weight_shared.astype(np.float32))
+
+        per_face_log_radius[next_view.name].append(np.log(right_shared).astype(np.float32))
+        per_face_log_scale[next_view.name].append((0.5 * log_ratio).astype(np.float32))
+        per_face_weights[next_view.name].append(weight_shared.astype(np.float32))
+
+    for view in layout.views:
+        name = view.name
+        if not per_face_log_radius[name]:
+            continue
+        curve = build_depth_layer_standardization_curve(
+            np.concatenate(per_face_log_radius[name]),
+            np.concatenate(per_face_log_scale[name]),
+            np.concatenate(per_face_weights[name]),
+        )
+        if curve is None:
+            continue
+        curves[name] = curve
+        diagnostics.append((name, int(np.concatenate(per_face_log_radius[name]).size), float(np.exp(np.max(np.abs(curve.log_scale_knots))))))
+    return curves, diagnostics
+
+
+def apply_depth_layer_standardization_curve(
+    gaussians: Gaussians3D,
+    curve: DepthLayerCurve | None,
+) -> tuple[Gaussians3D, int, float]:
+    if curve is None:
+        return gaussians, 0, 1.0
+
+    radial = torch.norm(gaussians.mean_vectors, dim=-1)[0].detach().cpu().numpy().astype(np.float32)
+    valid = np.isfinite(radial) & (radial > 1e-6)
+    if not np.any(valid):
+        return gaussians, 0, 1.0
+
+    per_point_scale = np.ones(radial.shape[0], dtype=np.float32)
+    per_point_scale[valid] = np.exp(sample_depth_layer_curve(curve, np.log(radial[valid]).astype(np.float32)))
+    per_point_scale = np.clip(per_point_scale, 0.5, 2.0)
+    valid_scales = per_point_scale[valid]
+    median_scale = float(np.median(valid_scales)) if valid_scales.size else 1.0
+    return apply_per_point_scales(gaussians, per_point_scale), int(valid.sum()), median_scale
+
+
+def apply_overlap_alignment_pipeline(
+    gaussians: Gaussians3D,
+    view: FaceOrientation,
+    global_scale: float,
+    primary_boundary_fields: Mapping[str, OverlapBoundaryField],
+    depth_layer_curve: DepthLayerCurve | None,
+    residual_boundary_fields: Mapping[str, OverlapBoundaryField],
+) -> tuple[Gaussians3D, dict[str, float | int]]:
+    gaussians, primary_points = apply_overlap_global_and_local_alignment(
+        gaussians,
+        view,
+        global_scale,
+        primary_boundary_fields,
+    )
+    gaussians, depth_points, depth_median_scale = apply_depth_layer_standardization_curve(gaussians, depth_layer_curve)
+    gaussians, residual_points = apply_overlap_alignment_fields(gaussians, view, residual_boundary_fields)
+    return gaussians, {
+        "primary_points": int(primary_points),
+        "depth_points": int(depth_points),
+        "depth_median_scale": float(depth_median_scale),
+        "residual_points": int(residual_points),
+    }
 
 
 def align_gaussians_to_reference(
@@ -1849,12 +2695,13 @@ def build_output_identity(
     grid_resolution: int,
     detail_weight: float,
     upscale_factor: int,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     return {
         "side_count": int(side_count),
         "grid_resolution": int(grid_resolution),
         "detail_preservation": int(round(float(np.clip(detail_weight, 0.0, 1.0)) * 100.0)),
         "upscale_factor": int(upscale_factor),
+        "alignment_mode": "da360",
     }
 
 
@@ -1877,6 +2724,8 @@ def resolve_output_conflict(
         suffixes.append(f"DP{current_output_identity['detail_preservation']}")
     if previous_output_identity.get("upscale_factor") != current_output_identity.get("upscale_factor"):
         suffixes.append(f"UF{current_output_identity['upscale_factor']}")
+    if previous_output_identity.get("alignment_mode") != current_output_identity.get("alignment_mode"):
+        suffixes.append(f"AL{current_output_identity['alignment_mode']}")
     if not suffixes:
         return output_path
 
@@ -1999,13 +2848,18 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
 
     pipeline_start = time.perf_counter()
     pipeline_succeeded = False
+    step_timings: list[StepTiming] = []
+    step_timings_token = CURRENT_STEP_TIMINGS.set(step_timings)
+    step_depth_token = CURRENT_STEP_TIMING_DEPTH.set(0)
     try:
         with log_timed_step("Resolve pipeline settings"):
             config = load_config(args.config)
             output_path, output_format = ensure_output_format(args.output, args.format, config)
             side_count = resolve_side_count(getattr(args, "side_count", 0), config)
             cutoff_height_percent = resolve_cutoff_height_percent(getattr(args, "cutoff_height_percent", 0.0), config)
-            da360_alignment_enabled = resolve_da360_alignment_enabled(args, config)
+            alignment_mode = resolve_alignment_mode(args, config)
+            da360_alignment_enabled = alignment_mode == "da360"
+            overlap_alignment_enabled = alignment_mode == "overlap"
             alignment_sweep_enabled = bool(getattr(args, "enable_alignment_sweep", False))
             da360_checkpoint_path = resolve_da360_checkpoint_path(args, config) if da360_alignment_enabled else None
             quality = args.quality if args.quality is not None else int(config.get("default_quality", 9))
@@ -2013,13 +2867,16 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
             clip_horizontal_raw = config.get("merge_clip_horizontal_degrees", 0)
             clip_horizontal_degrees = (360.0 / side_count) if clip_horizontal_raw in {None, 0, 0.0, "", False} else float(clip_horizontal_raw)
             clip_vertical_raw = config.get("merge_clip_vertical_degrees")
-            clip_vertical_degrees = None if clip_vertical_raw in {None, 0, 0.0, "", False} else float(clip_vertical_raw)
+            if clip_vertical_raw in {None, 0, 0.0, "", False}:
+                clip_vertical_degrees = None
+            else:
+                clip_vertical_degrees = float(str(clip_vertical_raw))
             if not (1 <= quality <= 9):
                 raise ValueError("Quality must be between 1 and 9.")
             if not (0 <= sh_degree <= 3):
                 raise ValueError("SH degree must be between 0 and 3.")
             if alignment_sweep_enabled and not da360_alignment_enabled:
-                raise ValueError("Alignment sweep mode requires DA360 alignment to be enabled.")
+                raise ValueError("Alignment sweep mode requires DA360 alignment mode.")
             if not (1.0 <= clip_horizontal_degrees <= 180.0):
                 raise ValueError("merge_clip_horizontal_degrees must be between 1 and 180.")
             if clip_vertical_degrees is not None and not (1.0 <= clip_vertical_degrees <= 180.0):
@@ -2051,6 +2908,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
             getattr(args, "alignment_detail_weight", 0.0),
             upscale_factor,
         )
+        current_output_identity["alignment_mode"] = alignment_mode
         resolved_output_path = resolve_output_conflict(
             output_path,
             alignment_sweep_enabled,
@@ -2234,6 +3092,8 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
                     reference_depth_panorama, reference_depth_views = load_cached_depth_arrays(view_names, depth_cache_dir)
                     LOGGER.info("Reusing cached DA360 depth from %s", depth_cache_dir)
                 else:
+                    if da360_checkpoint_path is None:
+                        raise ValueError("DA360 alignment is enabled, but no DA360 checkpoint path was resolved.")
                     LOGGER.info(
                         "Running DA360 panorama depth inference using checkpoint %s "
                         "(grid=%dx%d, detail=%.0f%%)",
@@ -2260,8 +3120,9 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
         else:
             step_manifests["da360"] = {"settings": {"enabled": False}}
 
+        raw_face_gaussians: dict[str, Gaussians3D]
         prepared_face_gaussians: dict[str, Gaussians3D]
-        sharp_cache_dir = cache_root / "prepared_gaussians"
+        sharp_cache_dir = cache_root / "raw_gaussians"
         sharp_step_settings = {
             "checkpoint": describe_path_for_cache(args.checkpoint) or {"default_model_url": DEFAULT_MODEL_URL},
             "config": describe_path_for_cache(args.config),
@@ -2270,43 +3131,44 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
             "resolved_face_height": int(image_height),
             "focal_x_px": round(float(focal_px), 6),
             "focal_y_px": round(float(focal_y_px), 6),
-            "clip_horizontal_degrees": round(float(clip_horizontal_degrees), 6),
-            "clip_vertical_degrees": None if clip_vertical_degrees is None else round(float(clip_vertical_degrees), 6),
             "deblur": step_manifests["deblur"]["settings"],
             "seedvr2": step_manifests["seedvr2"]["settings"],
         }
         required_sharp_paths = [sharp_cache_dir / f"{view_name}.pt" for view_name in view_names]
         if is_cache_step_valid(previous_manifest, "sharp", sharp_step_settings, required_sharp_paths):
-            with log_timed_step("Load cached SHARP face gaussians"):
-                prepared_face_gaussians = load_cached_face_gaussians(view_names, sharp_cache_dir)
-                LOGGER.info("Reusing cached SHARP face gaussians from %s", sharp_cache_dir)
+            with log_timed_step("Load cached raw SHARP face gaussians"):
+                raw_face_gaussians = load_cached_face_gaussians(view_names, sharp_cache_dir)
+                LOGGER.info("Reusing cached raw SHARP face gaussians from %s", sharp_cache_dir)
         else:
             with log_timed_step("Build SHARP predictor"):
                 predictor = build_predictor(args.checkpoint, device)
 
-            prepared_face_gaussians = {}
+            raw_face_gaussians = {}
             for view in extraction_layout.views:
                 with log_timed_step(f"Predict SHARP splats for view {view.name}"):
                     LOGGER.info("Predicting SHARP splats for view: %s", view.name)
                     gaussians = predict_image(predictor, faces[view.name], (focal_px, focal_y_px), device)
-                with log_timed_step(f"Filter Gaussians for view {view.name}"):
-                    gaussians = filter_gaussians_by_view_border(
-                        gaussians,
-                        horizontal_border_degrees=clip_horizontal_degrees,
-                        vertical_border_degrees=clip_vertical_degrees,
-                    )
-                prepared_face_gaussians[view.name] = gaussians.to(torch.device("cpu"))
+                raw_face_gaussians[view.name] = gaussians.to(torch.device("cpu"))
 
-            save_cached_face_gaussians(prepared_face_gaussians, sharp_cache_dir)
+            save_cached_face_gaussians(raw_face_gaussians, sharp_cache_dir)
             del predictor
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         step_manifests["sharp"] = {"settings": sharp_step_settings}
 
+        prepared_face_gaussians = {}
+        for view in extraction_layout.views:
+            with log_timed_step(f"Filter Gaussians for view {view.name}"):
+                prepared_face_gaussians[view.name] = filter_gaussians_by_view_border(
+                    raw_face_gaussians[view.name],
+                    horizontal_border_degrees=clip_horizontal_degrees,
+                    vertical_border_degrees=clip_vertical_degrees,
+                )
+
         if intermediate_dir is not None:
             with log_timed_step("Save raw per-face SHARP splats"):
                 save_intermediate_face_splats(
-                    prepared_face_gaussians,
+                    raw_face_gaussians,
                     focal_px,
                     focal_y_px,
                     image_width,
@@ -2315,11 +3177,102 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
                 )
 
         original_median_radii: list[float] = []
-        if da360_alignment_enabled:
+        if da360_alignment_enabled or overlap_alignment_enabled:
             for view_name in view_names:
                 original_median_radii.append(float(torch.median(torch.norm(
                     prepared_face_gaussians[view_name].mean_vectors, dim=-1,
                 )).item()))
+
+        overlap_alignment_scales = {view.name: 1.0 for view in extraction_layout.views}
+        overlap_alignment_fields = {view.name: {} for view in extraction_layout.views}
+        overlap_depth_layer_curves = {view.name: None for view in extraction_layout.views}
+        overlap_edge_refinement_fields = {view.name: {} for view in extraction_layout.views}
+        if overlap_alignment_enabled:
+            with log_timed_step("Resolve overlap-based face alignment"):
+                overlap_alignment_scales, overlap_diagnostics = resolve_overlap_alignment_scales(
+                    raw_face_gaussians,
+                    extraction_layout,
+                    config,
+                )
+                for left_name, right_name, ratio, shared_bins in overlap_diagnostics:
+                    LOGGER.info(
+                        "Overlap alignment constraint %s -> %s: relative_scale=%.6f (%d shared bins).",
+                        left_name,
+                        right_name,
+                        ratio,
+                        shared_bins,
+                    )
+                LOGGER.info(
+                    "Resolved overlap alignment scales: %s",
+                    ", ".join(f"{view.name}={overlap_alignment_scales[view.name]:.4f}" for view in extraction_layout.views),
+                )
+                overlap_alignment_fields, overlap_field_diagnostics = resolve_overlap_alignment_fields(
+                    raw_face_gaussians,
+                    extraction_layout,
+                    config,
+                    overlap_alignment_scales,
+                )
+                for left_name, right_name, residual_ratio, shared_bins in overlap_field_diagnostics:
+                    LOGGER.info(
+                        "Overlap seam field %s <-> %s: residual_ratio=%.6f (%d shared bins).",
+                        left_name,
+                        right_name,
+                        residual_ratio,
+                        shared_bins,
+                    )
+            with log_timed_step("Resolve overlap depth standardization"):
+                clipped_overlap_preview: dict[str, Gaussians3D] = {}
+                for view in extraction_layout.views:
+                    preview_gaussians, _preview_points = apply_overlap_global_and_local_alignment(
+                        prepared_face_gaussians[view.name],
+                        view,
+                        float(overlap_alignment_scales.get(view.name, 1.0)),
+                        overlap_alignment_fields.get(view.name, {}),
+                    )
+                    clipped_overlap_preview[view.name] = preview_gaussians.to(torch.device("cpu"))
+
+                overlap_depth_layer_curves, overlap_depth_diagnostics = resolve_overlap_depth_layer_standardization(
+                    clipped_overlap_preview,
+                    extraction_layout,
+                    config,
+                )
+                for view_name, sample_count, max_scale in overlap_depth_diagnostics:
+                    LOGGER.info(
+                        "Overlap depth standardization for %s: %d seam samples, max layer scale %.4f.",
+                        view_name,
+                        sample_count,
+                        max_scale,
+                    )
+
+                depth_standardized_preview: dict[str, Gaussians3D] = {}
+                for view in extraction_layout.views:
+                    standardized_gaussians, standardized_points, median_scale = apply_depth_layer_standardization_curve(
+                        clipped_overlap_preview[view.name],
+                        overlap_depth_layer_curves.get(view.name),
+                    )
+                    depth_standardized_preview[view.name] = standardized_gaussians.to(torch.device("cpu"))
+                    if standardized_points > 0:
+                        LOGGER.info(
+                            "Applied depth-layer preview standardization to %s: %d points, median scale %.4f.",
+                            view.name,
+                            standardized_points,
+                            median_scale,
+                        )
+
+                overlap_edge_refinement_fields, overlap_edge_diagnostics = resolve_clipped_edge_alignment_fields(
+                    depth_standardized_preview,
+                    extraction_layout,
+                    config,
+                    {view.name: 1.0 for view in extraction_layout.views},
+                )
+                for left_name, right_name, residual_ratio, shared_bins in overlap_edge_diagnostics:
+                    LOGGER.info(
+                        "Clipped-edge refinement field %s <-> %s: residual_ratio=%.6f (%d shared bins).",
+                        left_name,
+                        right_name,
+                        residual_ratio,
+                        shared_bins,
+                    )
 
         face_transforms = {
             view.name: face_transform_tensor(view, device)
@@ -2364,20 +3317,41 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
                     rotated_gaussian_list: list[Gaussians3D] = []
                     for view in extraction_layout.views:
                         gaussians = prepared_face_gaussians[view.name].to(device)
-                        gaussians, median_scale, sample_count = align_gaussians_to_reference(
-                            gaussians,
-                            reference_depth_views[view.name],
-                            focal_x_px=focal_px,
-                            focal_y_px=focal_y_px,
-                            image_width=image_width,
-                            image_height=image_height,
-                            grid_resolution=grid_resolution,
-                            detail_weight=detail_weight,
-                        )
-                        LOGGER.info(
-                            "Aligned %s for %s: median_scale=%.6f (%d samples).",
-                            view.name, combo_name, median_scale, sample_count,
-                        )
+                        if da360_alignment_enabled:
+                            gaussians, median_scale, sample_count = align_gaussians_to_reference(
+                                gaussians,
+                                reference_depth_views[view.name],
+                                focal_x_px=focal_px,
+                                focal_y_px=focal_y_px,
+                                image_width=image_width,
+                                image_height=image_height,
+                                grid_resolution=grid_resolution,
+                                detail_weight=detail_weight,
+                            )
+                            LOGGER.info(
+                                "Aligned %s for %s: median_scale=%.6f (%d samples).",
+                                view.name, combo_name, median_scale, sample_count,
+                            )
+                        elif overlap_alignment_enabled:
+                            overlap_scale = float(overlap_alignment_scales.get(view.name, 1.0))
+                            gaussians, overlap_metrics = apply_overlap_alignment_pipeline(
+                                gaussians,
+                                view,
+                                overlap_scale,
+                                overlap_alignment_fields.get(view.name, {}),
+                                overlap_depth_layer_curves.get(view.name),
+                                overlap_edge_refinement_fields.get(view.name, {}),
+                            )
+                            LOGGER.info(
+                                "Aligned %s for %s using overlap scale %.6f, %d primary seam points, %d depth-layer points (median %.4f), and %d clipped-edge refinement points.",
+                                view.name,
+                                combo_name,
+                                overlap_scale,
+                                int(overlap_metrics["primary_points"]),
+                                int(overlap_metrics["depth_points"]),
+                                float(overlap_metrics["depth_median_scale"]),
+                                int(overlap_metrics["residual_points"]),
+                            )
                         rotated = apply_transform(gaussians, face_transforms[view.name]).to(torch.device("cpu"))
                         rotated_gaussian_list.append(rotated)
 
@@ -2434,6 +3408,26 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
                             "(%d samples, orig_median_r=%.2f).",
                             view.name, median_scale, sample_count, orig_med,
                         )
+                elif overlap_alignment_enabled:
+                    with log_timed_step(f"Align view {view.name} from overlap"):
+                        overlap_scale = float(overlap_alignment_scales.get(view.name, 1.0))
+                        gaussians, overlap_metrics = apply_overlap_alignment_pipeline(
+                            gaussians,
+                            view,
+                            overlap_scale,
+                            overlap_alignment_fields.get(view.name, {}),
+                            overlap_depth_layer_curves.get(view.name),
+                            overlap_edge_refinement_fields.get(view.name, {}),
+                        )
+                        LOGGER.info(
+                            "Aligned %s from overlap constraints using scale %.6f, %d primary seam points, %d depth-layer points (median %.4f), and %d clipped-edge refinement points.",
+                            view.name,
+                            overlap_scale,
+                            int(overlap_metrics["primary_points"]),
+                            int(overlap_metrics["depth_points"]),
+                            float(overlap_metrics["depth_median_scale"]),
+                            int(overlap_metrics["residual_points"]),
+                        )
                 with log_timed_step(f"Rotate view {view.name} into world frame"):
                     rotated = apply_transform(gaussians, face_transforms[view.name]).to(torch.device("cpu"))
                 rotated_face_gaussians[view.name] = rotated
@@ -2453,7 +3447,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
             with log_timed_step("Merge rotated face splats"):
                 merged = merge_gaussians(rotated_gaussian_list)
 
-            if da360_alignment_enabled and original_median_radii:
+            if (da360_alignment_enabled or overlap_alignment_enabled) and original_median_radii:
                 with log_timed_step("Restore global scene scale"):
                     current_median = float(torch.median(torch.norm(
                         merged.mean_vectors, dim=-1,
@@ -2506,6 +3500,9 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
         )
     finally:
         total_elapsed = time.perf_counter() - pipeline_start
+        log_step_timing_summary(step_timings, total_elapsed)
+        CURRENT_STEP_TIMINGS.reset(step_timings_token)
+        CURRENT_STEP_TIMING_DEPTH.reset(step_depth_token)
         if pipeline_succeeded:
             LOGGER.info("Whole pipeline completed in %s", format_duration(total_elapsed))
         else:

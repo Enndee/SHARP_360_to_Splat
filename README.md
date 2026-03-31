@@ -169,6 +169,14 @@ When enabled, the pipeline predicts DA360 panorama depth, projects that referenc
 
 The default checkpoint path is `checkpoints/DA360_large.pth`.
 
+## Overlap Alignment
+
+As an alternative to DA360, the GUI now supports an `overlap` alignment mode.
+
+In this mode, adjacent face splats are compared directly inside their shared overlap band. The pipeline first solves per-face and per-seam scale corrections from the raw SHARP face splats, then runs a second refinement pass on the clipped seam splats to standardize depth layers and reduce residual edge offsets before the final merge.
+
+This is useful when DA360's global depth prior is not fitting the local face geometry well enough.
+
 ## Build
 
 Run `build_exe.bat` from a machine where the local `.venv` already exists.

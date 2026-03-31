@@ -55,6 +55,7 @@ def load_settings() -> dict:
         "gsbox": "",
         "intermediate_dir": "",
         "enable_da360_alignment": True,
+        "alignment_mode": str(PIPELINE_DEFAULTS.get("default_alignment_mode", "da360" if PIPELINE_DEFAULTS.get("default_enable_da360_alignment", True) else "none")),
         "alignment_grid_resolution": 4,
         "alignment_detail_weight": 0.0,
         "cutoff_height_percent": 0.0,
@@ -118,11 +119,32 @@ def load_settings() -> dict:
     detected_magick = insp_to_splat.find_imagemagick_executable(defaults.get("imagemagick_path", ""))
     if detected_magick is not None:
         defaults["imagemagick_path"] = str(detected_magick)
+    try:
+        defaults["alignment_mode"] = insp_to_splat.normalize_alignment_mode(defaults.get("alignment_mode", "da360"))
+    except ValueError:
+        defaults["alignment_mode"] = str(
+            PIPELINE_DEFAULTS.get(
+                "default_alignment_mode",
+                "da360" if PIPELINE_DEFAULTS.get("default_enable_da360_alignment", True) else "none",
+            )
+        )
     return defaults
 
 
 def save_settings(data: dict) -> None:
     try:
+        if "alignment_mode" in data:
+            try:
+                data = dict(data)
+                data["alignment_mode"] = insp_to_splat.normalize_alignment_mode(data.get("alignment_mode"))
+            except ValueError:
+                data = dict(data)
+                data["alignment_mode"] = str(
+                    PIPELINE_DEFAULTS.get(
+                        "default_alignment_mode",
+                        "da360" if PIPELINE_DEFAULTS.get("default_enable_da360_alignment", True) else "none",
+                    )
+                )
         with SETTINGS_PATH.open("w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
     except Exception:
@@ -236,6 +258,7 @@ class App(tk.Tk):
         self.gsbox_var = tk.StringVar(value=settings["gsbox"])
         self.intermediate_dir_var = tk.StringVar(value=settings["intermediate_dir"])
         self.enable_da360_alignment_var = tk.BooleanVar(value=bool(settings["enable_da360_alignment"]))
+        self.alignment_mode_var = tk.StringVar(value=str(settings["alignment_mode"]))
         self.alignment_grid_resolution_var = tk.IntVar(value=int(settings["alignment_grid_resolution"]))
         self.alignment_detail_weight_var = tk.DoubleVar(value=float(settings["alignment_detail_weight"]))
         self.cutoff_height_percent_var = tk.DoubleVar(value=float(settings["cutoff_height_percent"]))
@@ -505,7 +528,7 @@ class App(tk.Tk):
 
         self.da360_check = tk.Checkbutton(
             form_panel,
-            text="Align SHARP depth scale to DA360 panorama depth",
+            text="Enable slice alignment after SHARP prediction",
             variable=self.enable_da360_alignment_var,
             bg=BG2,
             fg=FG,
@@ -515,7 +538,7 @@ class App(tk.Tk):
             highlightthickness=0,
         )
         self.da360_check.grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        self._attach_tooltip(self.da360_check, "Use DA360 panorama depth as a reference to normalize SHARP's per-view depth scale before merging.")
+        self._attach_tooltip(self.da360_check, "Enable per-face alignment before merging. Use the mode selector below to choose DA360 depth alignment or overlap-based slice fitting.")
 
         # --- Depth alignment tuner sliders ---
         tuner_frame = tk.Frame(form_panel, bg=BG2)
@@ -574,6 +597,20 @@ class App(tk.Tk):
         self._cutoff_height_int_var = self.cutoff_height_scale.cget("variable")
         self.cutoff_height_scale.grid(row=2, column=1, sticky="ew", padx=(0, 6))
         self._on_cutoff_height_changed(int(self.cutoff_height_percent_var.get()))
+
+        self._alignment_mode_label = tk.Label(
+            tuner_frame, text="Alignment Mode", bg=BG2, fg=FG, anchor="w",
+        )
+        self._alignment_mode_label.grid(row=3, column=0, sticky="w", padx=(18, 6), pady=(4, 0))
+        self._attach_tooltip(self._alignment_mode_label, "Choose how neighboring face splats are aligned before merge. 'da360' uses the DA360 panorama depth reference. 'overlap' matches adjacent face splats directly in their overlap zone.")
+        self.alignment_mode_combo = ttk.Combobox(
+            tuner_frame,
+            textvariable=self.alignment_mode_var,
+            values=["da360", "overlap"],
+            state="readonly",
+        )
+        self.alignment_mode_combo.grid(row=3, column=1, sticky="ew", padx=(0, 6), pady=(4, 0))
+        self._attach_tooltip(self.alignment_mode_combo, "Switch between DA360-guided alignment and overlap-based slice fitting.")
 
         self.alignment_sweep_check = tk.Checkbutton(
             form_panel,
@@ -845,6 +882,7 @@ class App(tk.Tk):
             self.device_var,
             self.checkpoint_var,
             self.da360_checkpoint_var,
+            self.alignment_mode_var,
             self.gsbox_var,
             self.intermediate_dir_var,
             self.imagemagick_preset_var,
@@ -879,6 +917,8 @@ class App(tk.Tk):
             variable.trace_add("write", self._on_settings_changed)
         self.enable_da360_alignment_var.trace_add("write", self._on_settings_changed)
         self.enable_da360_alignment_var.trace_add("write", self._on_da360_alignment_changed)
+        self.alignment_mode_var.trace_add("write", self._on_settings_changed)
+        self.alignment_mode_var.trace_add("write", self._on_da360_alignment_changed)
         self.alignment_grid_resolution_var.trace_add("write", self._on_settings_changed)
         self.alignment_detail_weight_var.trace_add("write", self._on_settings_changed)
         self.cutoff_height_percent_var.trace_add("write", self._on_settings_changed)
@@ -921,6 +961,7 @@ class App(tk.Tk):
                 "gsbox": self.gsbox_var.get().strip(),
                 "intermediate_dir": self.intermediate_dir_var.get().strip(),
                 "enable_da360_alignment": bool(self.enable_da360_alignment_var.get()),
+                "alignment_mode": insp_to_splat.normalize_alignment_mode(self.alignment_mode_var.get()),
                 "alignment_grid_resolution": int(self.alignment_grid_resolution_var.get()),
                 "alignment_detail_weight": float(self.alignment_detail_weight_var.get()),
                 "cutoff_height_percent": float(self.cutoff_height_percent_var.get()),
@@ -997,18 +1038,27 @@ class App(tk.Tk):
 
     def _sync_alignment_tuner_state(self) -> None:
         enabled = getattr(self, "enable_da360_alignment_var", None) and self.enable_da360_alignment_var.get()
-        state = "normal" if enabled else "disabled"
+        alignment_mode = insp_to_splat.normalize_alignment_mode(self.alignment_mode_var.get()) if hasattr(self, "alignment_mode_var") else "da360"
+        general_state = "normal" if enabled else "disabled"
+        da360_state = "normal" if enabled and alignment_mode == "da360" else "disabled"
+        for widget in (
+            getattr(self, "cutoff_height_scale", None),
+            getattr(self, "_cutoff_height_label", None),
+            getattr(self, "_alignment_mode_label", None),
+        ):
+            if widget is not None:
+                widget.configure(state=general_state)
+        if getattr(self, "alignment_mode_combo", None) is not None:
+            self.alignment_mode_combo.configure(state="readonly" if enabled else "disabled")
         for widget in (
             getattr(self, "grid_res_scale", None),
             getattr(self, "detail_wt_scale", None),
-            getattr(self, "cutoff_height_scale", None),
             getattr(self, "_grid_res_label", None),
             getattr(self, "_detail_wt_label", None),
-            getattr(self, "_cutoff_height_label", None),
             getattr(self, "alignment_sweep_check", None),
         ):
             if widget is not None:
-                widget.configure(state=state)
+                widget.configure(state=da360_state)
 
     def _on_grid_res_changed(self, value) -> None:
         v = int(float(value))
@@ -1414,16 +1464,21 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("Invalid values", "Sides must be an integer and at least 2.")
             return False
+        alignment_mode = insp_to_splat.normalize_alignment_mode(self.alignment_mode_var.get())
         if self.enable_da360_alignment_var.get():
-            da360_checkpoint = self.da360_checkpoint_var.get().strip()
-            if not da360_checkpoint:
-                messagebox.showerror("DA360 checkpoint required", "Choose a DA360 checkpoint or disable DA360 alignment.")
-                return False
-            if not Path(da360_checkpoint).exists():
-                messagebox.showerror("Missing DA360 checkpoint", "The selected DA360 checkpoint does not exist.")
-                return False
+            if alignment_mode == "da360":
+                da360_checkpoint = self.da360_checkpoint_var.get().strip()
+                if not da360_checkpoint:
+                    messagebox.showerror("DA360 checkpoint required", "Choose a DA360 checkpoint or switch the alignment mode to overlap.")
+                    return False
+                if not Path(da360_checkpoint).exists():
+                    messagebox.showerror("Missing DA360 checkpoint", "The selected DA360 checkpoint does not exist.")
+                    return False
         elif self.enable_alignment_sweep_var.get():
             messagebox.showerror("DA360 alignment required", "Alignment sweep mode requires DA360 alignment to stay enabled.")
+            return False
+        if self.enable_alignment_sweep_var.get() and alignment_mode != "da360":
+            messagebox.showerror("DA360 mode required", "Alignment sweep mode currently works only with DA360 alignment mode.")
             return False
         if self.enable_imagemagick_optimization_var.get():
             magick_path = insp_to_splat.find_imagemagick_executable(self.imagemagick_path_var.get().strip())
@@ -1481,6 +1536,7 @@ class App(tk.Tk):
             checkpoint=Path(checkpoint_text) if checkpoint_text else None,
             da360_checkpoint=Path(da360_checkpoint_text) if da360_checkpoint_text else None,
             enable_da360_alignment=bool(self.enable_da360_alignment_var.get()),
+            alignment_mode=insp_to_splat.normalize_alignment_mode(self.alignment_mode_var.get()),
             alignment_grid_resolution=int(self.alignment_grid_resolution_var.get()),
             alignment_detail_weight=float(self.alignment_detail_weight_var.get()),
             cutoff_height_percent=float(self.cutoff_height_percent_var.get()),
