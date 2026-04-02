@@ -7,7 +7,7 @@
   "dit_offload_device": "cpu",
   "vae_offload_device": "cpu",
   "tensor_offload_device": "cpu",
-  "resolution_factor": "2",
+  "downscale_factor": "1.0",
   "max_resolution": "0",
   "batch_size": "1",
   "seed": "42",

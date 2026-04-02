@@ -15,10 +15,27 @@ if not exist "%GUI_SCRIPT%" (
 )
 
 if not exist "%SHARP_PY%" (
-    echo ERROR: Could not find the local .venv Python interpreter.
-    echo Run Setup_NewPC.bat first, then try again.
-    pause
-    exit /b 1
+    echo The local .venv Python interpreter was not found.
+    if exist "%SCRIPT_DIR%\Setup_NewPC.bat" (
+        choice /M "Run Setup_NewPC.bat now"
+        if errorlevel 2 exit /b 1
+        call "%SCRIPT_DIR%\Setup_NewPC.bat"
+        if errorlevel 1 (
+            echo.
+            echo Setup_NewPC.bat failed.
+            pause
+            exit /b 1
+        )
+    ) else (
+        echo ERROR: Could not find Setup_NewPC.bat next to this launcher.
+        pause
+        exit /b 1
+    )
+    if not exist "%SHARP_PY%" (
+        echo ERROR: Setup completed but the local .venv Python interpreter is still missing.
+        pause
+        exit /b 1
+    )
 )
 
 set "PYTHONUTF8=1"

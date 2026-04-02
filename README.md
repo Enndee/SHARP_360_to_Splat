@@ -59,6 +59,8 @@ Compressed exports require `gsbox.exe`.
 6. Select one image or multi-select several images in the file list.
 7. Click `Run Pipeline`.
 
+For release packages, `SHARP_360_to_Splat.exe` is a lightweight launcher. It does not bundle `torch`, CUDA wheels, or the full runtime stack into the EXE itself. Instead, those dependencies are installed into the local `.venv` by `Setup_NewPC.bat`, either ahead of time or on first launch.
+
 ## Setup Details
 
 `Setup_NewPC.bat` prepares a local portable-style environment for this repo.
@@ -145,6 +147,15 @@ An optional motion-deblur stage can run on extracted faces before SeedVR2 and SH
 
 This is meant to help with real capture blur from camera movement. It will not fully recover detail lost to severe motion smear, but it is materially different from simple sharpening.
 
+## Face Extraction
+
+Perspective faces keep the panorama-derived vertical coverage by default instead of collapsing to a square crop.
+
+- face width is derived from the horizontal slice span plus configured overlap
+- face height is derived from the panorama height
+- `Cut-off Height` removes the configured percentage symmetrically from the top and bottom of each extracted face
+- the extraction camera now uses separate horizontal and vertical handling so tall rectangular faces remain valid through SHARP, DA360 projection, and export
+
 ## SeedVR2 Integration
 
 SeedVR2 is not vendored into the main repository. Setup clones it from its upstream repository and installs its runtime dependencies locally.
@@ -152,14 +163,22 @@ SeedVR2 is not vendored into the main repository. Setup clones it from its upstr
 In the GUI you can enable face upscaling before SHARP prediction and configure key SeedVR2 parameters such as:
 
 - model
-- optional non-uniform stretch of the short side before the normal SeedVR2 run
-- resolution factor
+- `Equalize proportions via SeedVR2` to temporarily square non-square faces before the upscaler runs
+- `Pre-upscale downscale factor` to intentionally reduce the SeedVR2 input size before reconstructing detail
+- `min resolution` and `max resolution` in normal mode
+- `max resolution` only in equalized mode
 - batch size
 - offload settings
 - compile backend and mode
 - VAE tiling
 
-The SeedVR2 stretch option resizes only the short side of each extracted face while leaving the long side unchanged. It is applied as a temporary preprocessing step before the regular SeedVR2 run, without padding or cropping.
+Current SeedVR2 sizing rules:
+
+- with `Equalize proportions via SeedVR2` disabled, the face keeps its aspect ratio and the final longest side is clamped to the configured `min resolution` and `max resolution`
+- with `Equalize proportions via SeedVR2` enabled, the shorter side is expanded to match the current longest side before the SeedVR2 run, and only `max resolution` is used as the final cap
+- `Pre-upscale downscale factor` affects the temporary SeedVR2 input only; the final target size is still derived from the original extracted face size so the output does not stay downscaled
+
+The equalize option is a true non-uniform resize used only as a temporary SeedVR2 preprocessing step. It does not pad or crop the image.
 
 ## DA360 Alignment
 
@@ -184,18 +203,26 @@ Run `build_exe.bat` from a machine where the local `.venv` already exists.
 The build script:
 
 1. Installs PyInstaller into the local environment
-2. Builds `SHARP_360_to_Splat.exe`
+2. Builds a lightweight `SHARP_360_to_Splat.exe` bootstrap launcher
 3. Assembles a release folder under `release_pkg/`
-4. Bundles DA360 assets and optional extras
-5. Creates a zip archive for distribution
+4. Copies the Python source files and vendored `ml-sharp` tree required by setup/runtime
+5. Bundles DA360 assets and optional extras
+6. Creates a zip archive for distribution
 
 If `third_party/ImageMagick` exists locally at build time, it is bundled into the release package as well.
+
+The packaged EXE intentionally does not embed `torch`, `torchvision`, `torchaudio`, CUDA wheels, or the rest of the heavy Python runtime payload. Those are installed locally by `Setup_NewPC.bat` on the target machine.
 
 ## Release Package Contents
 
 - `SHARP_360_to_Splat.exe`
 - `!Launch_SHARP_360_to_Splat.bat`
 - `Setup_NewPC.bat`
+- `Easy_360_SHARP_GUI.py`
+- `insp_to_splat.py`
+- `insp_settings.json`
+- `seedvr2_settings.json`
+- `ml-sharp/`
 - `gsbox.exe`
 - `third_party/DA360/`
 - `third_party/ImageMagick/` when a local repo-managed ImageMagick install is present at build time

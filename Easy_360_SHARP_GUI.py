@@ -75,7 +75,7 @@ def load_settings() -> dict:
         "seedvr2_dit_offload_device": str(SEEDVR2_DEFAULTS.get("dit_offload_device", "cpu")),
         "seedvr2_vae_offload_device": str(SEEDVR2_DEFAULTS.get("vae_offload_device", "cpu")),
         "seedvr2_tensor_offload_device": str(SEEDVR2_DEFAULTS.get("tensor_offload_device", "cpu")),
-        "seedvr2_resolution_factor": str(SEEDVR2_DEFAULTS.get("resolution_factor", "2")),
+        "seedvr2_downscale_factor": str(SEEDVR2_DEFAULTS.get("downscale_factor", "1.0")),
         "seedvr2_stretch_proportions": bool(SEEDVR2_DEFAULTS.get("stretch_proportions", False)),
         "seedvr2_target_short_side": str(SEEDVR2_DEFAULTS.get("target_short_side", "0")),
         "seedvr2_min_resolution": str(SEEDVR2_DEFAULTS.get("min_resolution", "0")),
@@ -287,7 +287,7 @@ class App(tk.Tk):
         self.seedvr2_dit_offload_device_var = tk.StringVar(value=settings["seedvr2_dit_offload_device"])
         self.seedvr2_vae_offload_device_var = tk.StringVar(value=settings["seedvr2_vae_offload_device"])
         self.seedvr2_tensor_offload_device_var = tk.StringVar(value=settings["seedvr2_tensor_offload_device"])
-        self.seedvr2_resolution_factor_var = tk.StringVar(value=settings["seedvr2_resolution_factor"])
+        self.seedvr2_downscale_factor_var = tk.StringVar(value=settings["seedvr2_downscale_factor"])
         self.seedvr2_stretch_proportions_var = tk.BooleanVar(value=bool(settings["seedvr2_stretch_proportions"]))
         self.seedvr2_target_short_side_var = tk.StringVar(value=settings["seedvr2_target_short_side"])
         self.seedvr2_min_resolution_var = tk.StringVar(value=settings["seedvr2_min_resolution"])
@@ -318,6 +318,7 @@ class App(tk.Tk):
         self._bind_persistence()
         self._auto_detect_imagemagick_path()
         self._sync_temp_cleanup_state()
+        self._sync_seedvr2_resolution_state()
         self._sync_output_extension()
         initial_select_path = self.input_var.get().strip()
         if self._initial_input_paths:
@@ -584,7 +585,7 @@ class App(tk.Tk):
             tuner_frame, text="Cut-off Height: 0 %", bg=BG2, fg=FG, anchor="w",
         )
         self._cutoff_height_label.grid(row=2, column=0, sticky="w", padx=(18, 6))
-        self._attach_tooltip(self._cutoff_height_label, "Cuts off the lower part of each extracted panorama slice before SHARP processing to avoid highly distorted lower regions. Default: 0%.")
+        self._attach_tooltip(self._cutoff_height_label, "Symmetrically reduces the vertical field of view of each extracted face to crop highly distorted polar regions. 0% gives a square face image. Default: 0%.")
         self.cutoff_height_scale = tk.Scale(
             tuner_frame,
             from_=0, to=40,
@@ -713,14 +714,14 @@ class App(tk.Tk):
         self._combo_row(parent, 23, "Output format", self.seedvr2_output_format_var, ["png"], tooltip="File format used for the upscaled intermediate face images written by SeedVR2.")
         self._combo_row(parent, 24, "Color correction", self.seedvr2_color_correction_var, ["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"], tooltip="Color-matching method used to preserve the original panorama's look after SeedVR2 upscaling.")
         self._combo_row(parent, 25, "Attention mode", self.seedvr2_attention_mode_var, ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"], tooltip="Attention backend used by SeedVR2. Faster modes may depend on your GPU and installed libraries.")
-        self._entry_row(parent, 26, "Resolution factor", self.seedvr2_resolution_factor_var, "Multiplier for extracted face size", tooltip="Requested SeedVR2 upscale factor relative to the extracted face resolution.")
-        self._check_row(parent, 27, "Stretch proportions before SeedVR2", self.seedvr2_stretch_proportions_var, tooltip="Resize the short side of each SeedVR2 input face without changing the long side. If min resolution is 0, this now auto-squares to the current long side. This is a true non-uniform stretch, not padding or cropping.")
-        self._entry_row(parent, 28, "Target short side", self.seedvr2_target_short_side_var, "Ignored when min resolution is 0", tooltip="Manual short-side size used only when stretch proportions is enabled and min resolution is above 0. The long side stays unchanged.")
-        self._entry_row(parent, 29, "Min resolution", self.seedvr2_min_resolution_var, "0 disables the floor", tooltip="Minimum longest-side resolution after applying the factor. If the factor result is smaller, SeedVR2 upscales to this minimum instead.")
-        self._entry_row(parent, 30, "Max resolution", self.seedvr2_max_resolution_var, "0 disables the cap", tooltip="Upper bound for the longest side of the upscaled face. Use 0 to disable the clamp.")
-        self._entry_row(parent, 31, "Batch size", self.seedvr2_batch_size_var, "SeedVR2 image batch size", tooltip="How many faces SeedVR2 processes at once. Higher values use more VRAM.")
-        self._entry_row(parent, 32, "Seed", self.seedvr2_seed_var, tooltip="Random seed used by SeedVR2 for reproducible results.")
-        self._entry_row(parent, 33, "CUDA device", self.seedvr2_cuda_device_var, "Single GPU id or comma-separated list", tooltip="GPU id list passed to SeedVR2. Usually leave this as 0 on a single-GPU system.")
+        self._check_row(parent, 26, "Equalize proportions via SeedVR2", self.seedvr2_stretch_proportions_var, tooltip="Make non-square face inputs square before upscaling by extending the shorter side to the current longest side. In this mode only max resolution is used as a cap; the rest derives from the face's longest side.")
+        self._entry_row(parent, 27, "Pre-upscale downscale factor", self.seedvr2_downscale_factor_var, "1.0 keeps the original size", tooltip="Downscale the face before SeedVR2, then let SeedVR2 reconstruct detail. Values above 1.0 reduce the input size by division, for example 2.0 means half width and half height before upscale.")
+        min_label, min_entry, min_hint = self._entry_row(parent, 28, "Min resolution", self.seedvr2_min_resolution_var, "Used only when equalize is off", tooltip="Minimum longest-side target. If the input is smaller than this, SeedVR2 upscales to this minimum. Ignored when Equalize proportions via SeedVR2 is enabled.")
+        self._seedvr2_min_resolution_widgets = (min_label, min_entry, min_hint)
+        self._entry_row(parent, 29, "Max resolution", self.seedvr2_max_resolution_var, "0 disables the cap", tooltip="Upper bound for the final longest side. If the input exceeds this, the longest side is reduced to this value. With equalize enabled, this is the only resolution limit that applies.")
+        self._entry_row(parent, 30, "Batch size", self.seedvr2_batch_size_var, "SeedVR2 image batch size", tooltip="How many faces SeedVR2 processes at once. Higher values use more VRAM.")
+        self._entry_row(parent, 31, "Seed", self.seedvr2_seed_var, tooltip="Random seed used by SeedVR2 for reproducible results.")
+        self._entry_row(parent, 32, "CUDA device", self.seedvr2_cuda_device_var, "Single GPU id or comma-separated list", tooltip="GPU id list passed to SeedVR2. Usually leave this as 0 on a single-GPU system.")
         self._combo_row(parent, 34, "DiT offload", self.seedvr2_dit_offload_device_var, ["none", "cpu"], tooltip="Offload the diffusion transformer to CPU to reduce VRAM usage at the cost of speed.")
         self._combo_row(parent, 35, "VAE offload", self.seedvr2_vae_offload_device_var, ["none", "cpu"], tooltip="Offload the VAE to CPU to save VRAM. This usually slows processing.")
         self._combo_row(parent, 36, "Tensor offload", self.seedvr2_tensor_offload_device_var, ["none", "cpu"], tooltip="Move additional working tensors off the GPU when VRAM is tight.")
@@ -825,13 +826,15 @@ class App(tk.Tk):
             return
         self._tooltips.append(HoverTooltip(widget, text))
 
-    def _entry_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, hint: str = "", tooltip: str = "") -> None:
+    def _entry_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, hint: str = "", tooltip: str = "") -> tuple[ttk.Label, ttk.Entry, ttk.Label]:
         label_widget = ttk.Label(parent, text=label)
         label_widget.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
         self._attach_tooltip(label_widget, tooltip)
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", pady=6)
-        ttk.Label(parent, text=hint, style="Subtle.TLabel").grid(row=row, column=2, sticky="w", padx=(10, 0))
+        hint_widget = ttk.Label(parent, text=hint, style="Subtle.TLabel")
+        hint_widget.grid(row=row, column=2, sticky="w", padx=(10, 0))
+        return label_widget, entry, hint_widget
 
     def _combo_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, values: list[str], tooltip: str = "") -> None:
         label_widget = ttk.Label(parent, text=label)
@@ -898,8 +901,7 @@ class App(tk.Tk):
             self.seedvr2_dit_offload_device_var,
             self.seedvr2_vae_offload_device_var,
             self.seedvr2_tensor_offload_device_var,
-            self.seedvr2_resolution_factor_var,
-            self.seedvr2_target_short_side_var,
+            self.seedvr2_downscale_factor_var,
             self.seedvr2_min_resolution_var,
             self.seedvr2_max_resolution_var,
             self.seedvr2_batch_size_var,
@@ -937,6 +939,7 @@ class App(tk.Tk):
         self.imagemagick_despeckle_var.trace_add("write", self._on_settings_changed)
         self.imagemagick_unsharp_enabled_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_stretch_proportions_var.trace_add("write", self._on_settings_changed)
+        self.seedvr2_stretch_proportions_var.trace_add("write", self._on_seedvr2_mode_changed)
         self.seedvr2_swap_io_components_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_vae_encode_tiled_var.trace_add("write", self._on_settings_changed)
         self.seedvr2_vae_decode_tiled_var.trace_add("write", self._on_settings_changed)
@@ -982,7 +985,7 @@ class App(tk.Tk):
                 "seedvr2_dit_offload_device": self.seedvr2_dit_offload_device_var.get().strip(),
                 "seedvr2_vae_offload_device": self.seedvr2_vae_offload_device_var.get().strip(),
                 "seedvr2_tensor_offload_device": self.seedvr2_tensor_offload_device_var.get().strip(),
-                "seedvr2_resolution_factor": self.seedvr2_resolution_factor_var.get().strip(),
+                "seedvr2_downscale_factor": self.seedvr2_downscale_factor_var.get().strip(),
                 "seedvr2_stretch_proportions": bool(self.seedvr2_stretch_proportions_var.get()),
                 "seedvr2_target_short_side": self.seedvr2_target_short_side_var.get().strip(),
                 "seedvr2_min_resolution": self.seedvr2_min_resolution_var.get().strip(),
@@ -1036,6 +1039,9 @@ class App(tk.Tk):
     def _on_da360_alignment_changed(self, *_args) -> None:
         self._sync_alignment_tuner_state()
 
+    def _on_seedvr2_mode_changed(self, *_args) -> None:
+        self._sync_seedvr2_resolution_state()
+
     def _sync_alignment_tuner_state(self) -> None:
         enabled = getattr(self, "enable_da360_alignment_var", None) and self.enable_da360_alignment_var.get()
         alignment_mode = insp_to_splat.normalize_alignment_mode(self.alignment_mode_var.get()) if hasattr(self, "alignment_mode_var") else "da360"
@@ -1074,6 +1080,13 @@ class App(tk.Tk):
         v = int(float(value))
         self._cutoff_height_label.configure(text=f"Cut-off Height: {v} %")
         self.cutoff_height_percent_var.set(float(v))
+
+    def _sync_seedvr2_resolution_state(self) -> None:
+        equalize_enabled = bool(getattr(self, "seedvr2_stretch_proportions_var", None) and self.seedvr2_stretch_proportions_var.get())
+        min_state = "disabled" if equalize_enabled else "normal"
+        for widget in getattr(self, "_seedvr2_min_resolution_widgets", ()): 
+            if widget is not None:
+                widget.configure(state=min_state)
 
     def _on_format_changed(self, *_args) -> None:
         self._sync_output_extension()
@@ -1492,20 +1505,37 @@ class App(tk.Tk):
             if self.imagemagick_unsharp_enabled_var.get() and not self.imagemagick_unsharp_value_var.get().strip():
                 messagebox.showerror("ImageMagick unsharp required", "Provide unsharp values or disable the unsharp option.")
                 return False
-        if self.enable_seedvr2_upscale_var.get() and self.seedvr2_stretch_proportions_var.get():
-            min_resolution_text = self.seedvr2_min_resolution_var.get().strip()
+        if self.enable_seedvr2_upscale_var.get():
             try:
-                min_resolution = int(min_resolution_text) if min_resolution_text else 0
+                downscale_factor = float(self.seedvr2_downscale_factor_var.get().strip() or "1.0")
+            except ValueError:
+                messagebox.showerror("Invalid SeedVR2 downscale factor", "Pre-upscale downscale factor must be a number greater than or equal to 1.0.")
+                return False
+            if downscale_factor < 1.0:
+                messagebox.showerror("Invalid SeedVR2 downscale factor", "Pre-upscale downscale factor must be greater than or equal to 1.0.")
+                return False
+
+            try:
+                min_resolution = int(self.seedvr2_min_resolution_var.get().strip() or "0")
             except ValueError:
                 messagebox.showerror("Invalid SeedVR2 minimum resolution", "Min resolution must be an integer.")
                 return False
-            if min_resolution > 0:
-                try:
-                    if int(self.seedvr2_target_short_side_var.get().strip()) <= 0:
-                        raise ValueError
-                except ValueError:
-                    messagebox.showerror("Invalid SeedVR2 stretch", "Target short side must be an integer greater than 0 when stretch proportions is enabled and min resolution is above 0.")
-                    return False
+            if min_resolution < 0:
+                messagebox.showerror("Invalid SeedVR2 minimum resolution", "Min resolution cannot be negative.")
+                return False
+
+            try:
+                max_resolution = int(self.seedvr2_max_resolution_var.get().strip() or "0")
+            except ValueError:
+                messagebox.showerror("Invalid SeedVR2 maximum resolution", "Max resolution must be an integer.")
+                return False
+            if max_resolution < 0:
+                messagebox.showerror("Invalid SeedVR2 maximum resolution", "Max resolution cannot be negative.")
+                return False
+
+            if not self.seedvr2_stretch_proportions_var.get() and min_resolution > 0 and max_resolution > 0 and min_resolution > max_resolution:
+                messagebox.showerror("Invalid SeedVR2 resolution range", "Min resolution cannot be greater than max resolution when Equalize proportions via SeedVR2 is disabled.")
+                return False
         if self.format_var.get().strip() in {"spx", "spz", "sog"} and not self.gsbox_var.get().strip() and not (ROOT_DIR / "gsbox.exe").exists():
             messagebox.showerror("gsbox required", "Compressed output needs gsbox.exe. Pick it in the GUI or place it next to this script.")
             return False

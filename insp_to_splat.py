@@ -444,7 +444,7 @@ def load_seedvr2_settings() -> dict:
         "dit_offload_device": "seedvr2_dit_offload_device",
         "vae_offload_device": "seedvr2_vae_offload_device",
         "tensor_offload_device": "seedvr2_tensor_offload_device",
-        "resolution_factor": "seedvr2_resolution_factor",
+        "downscale_factor": "seedvr2_downscale_factor",
         "stretch_proportions": "seedvr2_stretch_proportions",
         "target_short_side": "seedvr2_target_short_side",
         "min_resolution": "seedvr2_min_resolution",
@@ -472,6 +472,26 @@ def load_seedvr2_settings() -> dict:
     return settings
 
 
+def resolve_seedvr2_downscale_dimensions(
+    image_width: int,
+    image_height: int,
+    settings: Mapping[str, Any],
+) -> tuple[int, int, float]:
+    downscale_factor_raw = settings.get("downscale_factor", 1.0)
+    try:
+        downscale_factor = float(downscale_factor_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SeedVR2 downscale factor must be a number greater than or equal to 1.0.") from exc
+    if downscale_factor < 1.0:
+        raise ValueError("SeedVR2 downscale factor must be greater than or equal to 1.0.")
+    if downscale_factor <= 1.0001:
+        return image_width, image_height, 1.0
+
+    downscaled_width = max(1, int(round(image_width / downscale_factor)))
+    downscaled_height = max(1, int(round(image_height / downscale_factor)))
+    return downscaled_width, downscaled_height, downscale_factor
+
+
 def resolve_seedvr2_stretch_dimensions(
     image_width: int,
     image_height: int,
@@ -480,41 +500,8 @@ def resolve_seedvr2_stretch_dimensions(
     if not bool(settings.get("stretch_proportions", False)):
         return image_width, image_height, False
 
-    short_side = min(image_width, image_height)
     long_side = max(image_width, image_height)
-    min_res = int(settings.get("min_resolution", 0) or 0)
-
-    # When no minimum output resolution floor is set, stretching defaults to a
-    # square input that matches the current long side.
-    if min_res <= 0:
-        if image_width >= image_height:
-            target_width, target_height = long_side, long_side
-        else:
-            target_width, target_height = long_side, long_side
-        return target_width, target_height, (target_width, target_height) != (image_width, image_height)
-
-    target_short_side_raw = settings.get("target_short_side", 0)
-    try:
-        target_short_side = int(target_short_side_raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("SeedVR2 target short side must be an integer when stretch proportions is enabled.") from exc
-
-    if target_short_side <= 0:
-        raise ValueError("SeedVR2 target short side must be greater than 0 when stretch proportions is enabled.")
-
-    if target_short_side < short_side:
-        raise ValueError(
-            f"SeedVR2 target short side {target_short_side} is smaller than the current short side {short_side}."
-        )
-    if target_short_side > long_side:
-        raise ValueError(
-            f"SeedVR2 target short side {target_short_side} exceeds the current long side {long_side}."
-        )
-
-    if image_width >= image_height:
-        target_width, target_height = long_side, target_short_side
-    else:
-        target_width, target_height = target_short_side, long_side
+    target_width, target_height = long_side, long_side
     return target_width, target_height, (target_width, target_height) != (image_width, image_height)
 
 
@@ -669,18 +656,18 @@ def deblur_faces_with_motion_rl(
 def resolve_seedvr2_target_dimensions(
     image_width: int,
     image_height: int,
+    reference_longest_side: int,
     settings: Mapping[str, Any],
 ) -> tuple[int, int, int]:
-    factor = int(settings.get("resolution_factor", 2))
     min_res = int(settings.get("min_resolution", 0))
     max_res = int(settings.get("max_resolution", 0))
-    longest_side = max(image_width, image_height)
-    target_resolution = longest_side * factor
-    if min_res > 0 and target_resolution < min_res:
+    processed_longest_side = max(image_width, image_height)
+    target_resolution = max(1, int(reference_longest_side))
+    if not bool(settings.get("stretch_proportions", False)) and min_res > 0 and target_resolution < min_res:
         target_resolution = min_res
     if max_res > 0 and target_resolution > max_res:
         target_resolution = max_res
-    scale_factor = target_resolution / float(max(1, longest_side))
+    scale_factor = target_resolution / float(max(1, processed_longest_side))
     expected_image_width = max(1, int(round(image_width * scale_factor)))
     expected_image_height = max(1, int(round(image_height * scale_factor)))
     return target_resolution, expected_image_width, expected_image_height
@@ -858,18 +845,23 @@ def upscale_faces_with_seedvr2(
     temp_root: Path,
 ) -> tuple[dict[str, np.ndarray], int, int]:
     settings = load_seedvr2_settings()
-    seedvr2_input_width, seedvr2_input_height, stretch_applied = resolve_seedvr2_stretch_dimensions(
+    seedvr2_base_width, seedvr2_base_height, downscale_factor = resolve_seedvr2_downscale_dimensions(
         image_width,
         image_height,
         settings,
     )
-    factor = int(settings.get("resolution_factor", 2))
+    seedvr2_input_width, seedvr2_input_height, stretch_applied = resolve_seedvr2_stretch_dimensions(
+        seedvr2_base_width,
+        seedvr2_base_height,
+        settings,
+    )
     min_res = int(settings.get("min_resolution", 0))
     max_res = int(settings.get("max_resolution", 0))
-    longest_side = max(seedvr2_input_width, seedvr2_input_height)
+    original_reference_longest_side = max(image_width, image_height)
     target_resolution, expected_image_width, expected_image_height = resolve_seedvr2_target_dimensions(
         seedvr2_input_width,
         seedvr2_input_height,
+        original_reference_longest_side,
         settings,
     )
 
@@ -878,23 +870,29 @@ def upscale_faces_with_seedvr2(
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if stretch_applied:
-        stretch_target_label = (
-            f"auto-square from long side {max(image_width, image_height)}"
-            if int(settings.get("min_resolution", 0) or 0) <= 0
-            else str(settings.get("target_short_side", ""))
-        )
+    if downscale_factor > 1.0001:
         LOGGER.info(
-            "Stretching SeedVR2 inputs before upscale: %dx%d -> %dx%d (target short side %s)",
+            "Downscaling SeedVR2 source faces before upscale: %dx%d -> %dx%d (factor %.3f)",
             image_width,
             image_height,
+            seedvr2_base_width,
+            seedvr2_base_height,
+            downscale_factor,
+        )
+
+    if stretch_applied:
+        LOGGER.info(
+            "Equalizing SeedVR2 input proportions before upscale: %dx%d -> %dx%d using the longest side as the square target.",
+            seedvr2_base_width,
+            seedvr2_base_height,
             seedvr2_input_width,
             seedvr2_input_height,
-            stretch_target_label,
         )
 
     for name, image_array in faces.items():
         image = Image.fromarray(image_array)
+        if downscale_factor > 1.0001:
+            image = image.resize((seedvr2_base_width, seedvr2_base_height), Image.Resampling.LANCZOS)
         if stretch_applied:
             image = image.resize((seedvr2_input_width, seedvr2_input_height), Image.Resampling.LANCZOS)
         image.save(input_dir / f"{name}.png")
@@ -948,8 +946,8 @@ def upscale_faces_with_seedvr2(
         cmd.append("--debug")
 
     LOGGER.info(
-        "Running SeedVR2 upscale: %d faces, %dx%d input (%dx%d after stretch) -> longest side %d, target %d (factor %d, min %d, max %d)",
-        len(faces), image_width, image_height, seedvr2_input_width, seedvr2_input_height, longest_side, target_resolution, factor, min_res, max_res,
+        "Running SeedVR2 upscale: %d faces, %dx%d original -> %dx%d preprocessed -> target longest side %d (min %d, max %d, equalized=%s)",
+        len(faces), image_width, image_height, seedvr2_input_width, seedvr2_input_height, target_resolution, min_res, max_res, stretch_applied,
     )
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1197,13 +1195,14 @@ def resolve_cutoff_height_percent(requested: float, config: dict) -> float:
 
 
 def resolve_extraction_image_height(panorama_height: int, cutoff_height_percent: float) -> int:
+    # cutoff_height_percent is applied symmetrically: N% from top + N% from bottom.
     base_height = max(64, int(round(panorama_height)))
-    return max(64, int(round(base_height * (1.0 - (cutoff_height_percent / 100.0)))))
+    return max(64, int(round(base_height * (1.0 - 2.0 * cutoff_height_percent / 100.0))))
 
 
-def resolve_extraction_focal_y(focal_x_px: float, image_width: int, image_height: int) -> float:
-    # Taller rectangular slices keep the same angular density vertically by scaling fy with the output aspect ratio.
-    return float(focal_x_px) * (float(image_height) / float(max(1, image_width)))
+def resolve_extraction_focal_y(focal_x_px: float) -> float:
+    # Square pixels: focal_y equals focal_x.  Vertical FOV is controlled solely by image_height.
+    return float(focal_x_px)
 
 
 def build_extraction_layout(
@@ -1220,7 +1219,7 @@ def build_extraction_layout(
     image_width = max(face_size, int(round(face_size * (view_fov_degrees / span_degrees))))
     focal_px = (image_width / 2.0) / np.tan(np.deg2rad(view_fov_degrees) / 2.0)
     image_height = resolve_extraction_image_height(panorama_height, cutoff_height_percent)
-    focal_y_px = resolve_extraction_focal_y(focal_px, image_width, image_height)
+    focal_y_px = resolve_extraction_focal_y(focal_px)
     views = tuple(make_horizon_view(index, side_count) for index in range(side_count))
     return ExtractionLayout(f"horizon{side_count}", views, focal_px, focal_y_px, image_width, image_height)
 
@@ -2694,13 +2693,11 @@ def build_output_identity(
     side_count: int,
     grid_resolution: int,
     detail_weight: float,
-    upscale_factor: int,
 ) -> dict[str, Any]:
     return {
         "side_count": int(side_count),
         "grid_resolution": int(grid_resolution),
         "detail_preservation": int(round(float(np.clip(detail_weight, 0.0, 1.0)) * 100.0)),
-        "upscale_factor": int(upscale_factor),
         "alignment_mode": "da360",
     }
 
@@ -2722,8 +2719,6 @@ def resolve_output_conflict(
         suffixes.append(f"GR{current_output_identity['grid_resolution']}")
     if previous_output_identity.get("detail_preservation") != current_output_identity.get("detail_preservation"):
         suffixes.append(f"DP{current_output_identity['detail_preservation']}")
-    if previous_output_identity.get("upscale_factor") != current_output_identity.get("upscale_factor"):
-        suffixes.append(f"UF{current_output_identity['upscale_factor']}")
     if previous_output_identity.get("alignment_mode") != current_output_identity.get("alignment_mode"):
         suffixes.append(f"AL{current_output_identity['alignment_mode']}")
     if not suffixes:
@@ -2901,12 +2896,10 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
         deblur_preprocessing_enabled = bool(getattr(args, "enable_deblur_preprocessing", False))
         deblur_strength = normalize_deblur_strength(getattr(args, "deblur_strength", "medium"))
         seedvr2_settings = load_seedvr2_settings() if seedvr2_upscale_enabled else None
-        upscale_factor = int(seedvr2_settings.get("resolution_factor", 2)) if seedvr2_settings is not None else 1
         current_output_identity = build_output_identity(
             side_count,
             getattr(args, "alignment_grid_resolution", 8),
             getattr(args, "alignment_detail_weight", 0.0),
-            upscale_factor,
         )
         current_output_identity["alignment_mode"] = alignment_mode
         resolved_output_path = resolve_output_conflict(
@@ -3034,6 +3027,7 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult:
                 _, expected_upscaled_width, expected_upscaled_height = resolve_seedvr2_target_dimensions(
                     seedvr2_input_width,
                     seedvr2_input_height,
+                    max(image_width, image_height),
                     seedvr2_settings,
                 )
             seedvr2_step_settings = {

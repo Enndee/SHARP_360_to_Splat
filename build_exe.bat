@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 set "APP_NAME=SHARP_360_to_Splat"
-set "RELEASE_VERSION=1.5.1"
+set "RELEASE_VERSION=1.5.2"
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 cd /d "%SCRIPT_DIR%"
@@ -39,11 +39,22 @@ if errorlevel 1 (
 set "PYTHON_BASE="
 set "TCL_LIBRARY="
 set "TK_LIBRARY="
-for /f "usebackq tokens=1,2,3 delims=|" %%A in (`"%SHARP_PY%" -c "import sys, pathlib; base=pathlib.Path(sys.base_prefix); print(str(base) + '|' + str(base / 'tcl' / 'tcl8.6') + '|' + str(base / 'tcl' / 'tk8.6'))"`) do (
-    set "PYTHON_BASE=%%~A"
-    set "TCL_LIBRARY=%%~B"
-    set "TK_LIBRARY=%%~C"
+set "PYINFO_FILE=%TEMP%\sharp_pyinfo_%RANDOM%_%RANDOM%.txt"
+"%SHARP_PY%" -c "import sys,pathlib; base=pathlib.Path(sys.base_prefix); print(base); print(base / 'tcl' / 'tcl8.6'); print(base / 'tcl' / 'tk8.6')" > "%PYINFO_FILE%"
+if errorlevel 1 (
+    echo ERROR: Could not determine the base Python installation for the venv.
+    if exist "%PYINFO_FILE%" del /Q "%PYINFO_FILE%" >nul 2>&1
+    pause
+    exit /b 1
 )
+set /a PYINFO_INDEX=0
+for /f "usebackq delims=" %%A in ("%PYINFO_FILE%") do (
+    if !PYINFO_INDEX! EQU 0 set "PYTHON_BASE=%%~A"
+    if !PYINFO_INDEX! EQU 1 set "TCL_LIBRARY=%%~A"
+    if !PYINFO_INDEX! EQU 2 set "TK_LIBRARY=%%~A"
+    set /a PYINFO_INDEX+=1
+)
+if exist "%PYINFO_FILE%" del /Q "%PYINFO_FILE%" >nul 2>&1
 
 if not defined PYTHON_BASE (
     echo ERROR: Could not determine the base Python installation for the venv.
@@ -57,22 +68,18 @@ echo       TK_LIBRARY=%TK_LIBRARY%
 set "PATH=%PYTHON_BASE%;%PYTHON_BASE%\DLLs;%PATH%"
 
 echo.
-echo [3/5] Building %APP_NAME%.exe ...
+echo [3/5] Building lightweight %APP_NAME%.exe launcher ...
 "%SHARP_PY%" -m PyInstaller ^
     --onefile ^
     --windowed ^
     --name "%APP_NAME%" ^
-    --hidden-import plyfile ^
-    --hidden-import numpy ^
-    --hidden-import PIL ^
-    --hidden-import PIL.Image ^
-    --hidden-import PIL.ImageOps ^
-    --hidden-import PIL.ImageTk ^
-    --collect-all plyfile ^
-    --collect-all PIL ^
     --add-data "%TCL_LIBRARY%;tcl" ^
     --add-data "%TK_LIBRARY%;tk" ^
-    "Easy_360_SHARP_GUI.py"
+    --exclude-module torch ^
+    --exclude-module torchvision ^
+    --exclude-module torchaudio ^
+    --exclude-module triton ^
+    "bootstrap_launcher.py"
 
 if errorlevel 1 (
     echo ERROR: PyInstaller build failed.
@@ -94,7 +101,15 @@ if errorlevel 1 (
 copy /Y "dist\%APP_NAME%.exe" "%PACKAGE_DIR%\" >nul
 copy /Y "!Launch_SHARP_360_to_Splat.bat" "%PACKAGE_DIR%\" >nul
 copy /Y "Setup_NewPC.bat" "%PACKAGE_DIR%\" >nul
+copy /Y "Easy_360_SHARP_GUI.py" "%PACKAGE_DIR%\" >nul
+copy /Y "insp_to_splat.py" "%PACKAGE_DIR%\" >nul
+copy /Y "insp_settings.json" "%PACKAGE_DIR%\" >nul
+copy /Y "seedvr2_settings.json" "%PACKAGE_DIR%\" >nul
+copy /Y "README.md" "%PACKAGE_DIR%\" >nul
 copy /Y "gsbox.exe" "%PACKAGE_DIR%\" >nul
+
+if not exist "%PACKAGE_DIR%\ml-sharp" mkdir "%PACKAGE_DIR%\ml-sharp"
+xcopy /E /I /Y "ml-sharp\*" "%PACKAGE_DIR%\ml-sharp\" >nul
 
 if not exist "%PACKAGE_DIR%\third_party\DA360" mkdir "%PACKAGE_DIR%\third_party\DA360"
 xcopy /E /I /Y "third_party\DA360\*" "%PACKAGE_DIR%\third_party\DA360\" >nul
@@ -140,18 +155,29 @@ if exist "easy_360_sharp_gui_settings.json" del /Q "%PACKAGE_DIR%\easy_360_sharp
     echo   Run Setup_NewPC.bat  -- creates the local .venv, clones SeedVR2, and installs dependencies.
     echo.
     echo USAGE
-    echo   - Double-click SHARP_360_to_Splat.exe and use the file picker, OR
+    echo   - Double-click SHARP_360_to_Splat.exe and it will launch the GUI or offer to run Setup_NewPC.bat on first use, OR
     echo   - Right-click any JPEG/PNG -^> Send To -^> SHARP_360_to_Splat
     echo     ^(Setup_NewPC.bat creates the Send To shortcut automatically^)
     echo   - DA360 depth alignment is enabled by default when checkpoints\DA360_large.pth is present
     echo   - If third_party\ImageMagick\ is bundled, the GUI uses that local copy first
+    echo   - SeedVR2 supports equalizing non-square faces before upscale and an optional pre-upscale downscale factor
     echo   - Double-click splat files in the GUI to open them in the configured viewer
     echo.
+    echo IMPORTANT
+    echo   - This EXE is a lightweight launcher only.
+    echo   - Torch, CUDA runtime packages, and other heavy Python dependencies are NOT bundled into the EXE package.
+    echo   - Setup_NewPC.bat installs those dependencies into .venv on the target machine.
+    echo.
     echo FOLDER STRUCTURE
-    echo   SHARP_360_to_Splat.exe    - launcher
+    echo   SHARP_360_to_Splat.exe    - lightweight launcher
     echo   gsbox.exe                 - format conversion helper
     echo   !Launch_SHARP_360_to_Splat.bat - script launcher
     echo   Setup_NewPC.bat           - one-time environment installer
+    echo   Easy_360_SHARP_GUI.py     - main GUI source
+    echo   insp_to_splat.py          - main pipeline source
+    echo   insp_settings.json        - pipeline defaults
+    echo   seedvr2_settings.json     - SeedVR2 defaults
+    echo   ml-sharp\                - vendored SHARP source used by setup/runtime
     echo   third_party\DA360\       - vendored DA360 inference code
     echo   third_party\ImageMagick\ - optional bundled ImageMagick runtime
     echo   checkpoints\DA360_large.pth - default DA360 checkpoint

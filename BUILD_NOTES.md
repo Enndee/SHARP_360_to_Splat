@@ -1,5 +1,19 @@
 # Build Notes
 
+## v1.5.2 Release Notes
+
+### Packaging changes
+
+1. The release package is now intended to ship the updated overlap alignment pipeline, the corrected tall-face extraction behavior, and the new SeedVR2 equalize and pre-downscale controls together.
+2. The packaged README text should describe `Equalize proportions via SeedVR2`, `Pre-upscale downscale factor`, and the current min/max resolution rules instead of the older resolution-factor workflow.
+
+### Behavior changes worth verifying before release
+
+1. Face extraction keeps panorama-derived vertical coverage, and `Cut-off Height` trims the top and bottom symmetrically.
+2. SeedVR2 pre-downscale is now input-only; the final upscaled output size is still based on the original extracted face size.
+3. In non-equalized SeedVR2 mode, output size is driven only by min/max longest-side limits.
+4. In equalized SeedVR2 mode, only max resolution constrains the final output size.
+
 ## v1.5 Release Postmortem
 
 ### Problems encountered
