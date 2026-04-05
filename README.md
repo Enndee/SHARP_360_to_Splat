@@ -1,5 +1,7 @@
 # SHARP_360_to_Splat
 
+https://github.com/user-attachments/assets/bafbdace-d01e-431f-84a7-c2403a0c2c33
+
 SHARP_360_to_Splat is a Windows desktop workflow for turning stitched 2:1 equirectangular 360 panoramas into Gaussian splat outputs using Apple's SHARP model.
 
 It wraps the full process in a GUI with source browsing, preview, batch selection, optional preprocessing, optional SeedVR2 upscaling, optional DA360 depth alignment, and export to standard or compressed splat formats.
