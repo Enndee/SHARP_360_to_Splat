@@ -1,0 +1,22 @@
+{
+  "default_side_count": 4,
+  "horizon_overlap_degrees": 10.0,
+  "merge_clip_horizontal_degrees": 0,
+  "merge_clip_vertical_degrees": 0,
+  "default_face_size_mode": "width_div_sides",
+  "default_face_size": 1536,
+  "default_output_format": "ply",
+  "default_quality": 9,
+  "default_sh_degree": 0,
+  "default_alignment_mode": "overlap",
+  "default_enable_da360_alignment": false,
+  "default_da360_checkpoint": "checkpoints/DA360_large.pth",
+  "notes": [
+    "Starter package defaults to overlap alignment because DA360 assets are not bundled.",
+    "Export JPEG, PNG, or HEIC inputs as stitched 2:1 equirectangular panoramas before running this pipeline.",
+    "Set side_count in the GUI to choose how many evenly spaced horizon views are extracted.",
+    "The default overlap is controlled by horizon_overlap_degrees and the per-view border clip defaults to the side span when merge_clip_horizontal_degrees is 0.",
+    "Two-side mode is experimental because exact 180-degree pinhole views are not possible.",
+    "Use Insta360 Studio for stitching and horizon leveling before conversion when needed."
+  ]
+}

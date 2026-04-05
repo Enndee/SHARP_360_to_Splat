@@ -6,7 +6,8 @@ if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 
 set "VENV_DIR=%SCRIPT_DIR%\.venv"
 set "PYTHON_EXE=%VENV_DIR%\Scripts\python.exe"
-set "TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128"
+set "TORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu128"
+set "TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu"
 set "TORCH_PINNED=torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0"
 set "TRITON_PINNED=triton-windows<3.5"
 set "SEEDVR2_REPO=https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
@@ -21,12 +22,19 @@ set "CHECKPOINT_URL=https://drive.google.com/uc?id=1NYF4yJR83HEtxzOURLdmONeUe413
 set "PYTHON_BOOTSTRAP="
 set "DRY_RUN=0"
 set "SKIP_CHECKPOINT=0"
+set "INSTALL_SEEDVR2=ask"
+set "CPU_ONLY=ask"
 
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="--dry-run" set "DRY_RUN=1"
 if /I "%~1"=="--skip-checkpoint" set "SKIP_CHECKPOINT=1"
 if /I "%~1"=="--skip-models" set "SKIP_CHECKPOINT=1"
+if /I "%~1"=="--skip-seedvr2" set "INSTALL_SEEDVR2=0"
+if /I "%~1"=="--with-seedvr2" set "INSTALL_SEEDVR2=1"
+if /I "%~1"=="--cpu-only" set "CPU_ONLY=1"
+if /I "%~1"=="--no-cuda" set "CPU_ONLY=1"
+if /I "%~1"=="--with-cuda" set "CPU_ONLY=0"
 if /I "%~1"=="--help" goto usage
 if /I "%~1"=="/?" goto usage
 shift
@@ -41,9 +49,9 @@ echo.
 echo This script will:
 echo   1. Detect Python 3.13
 echo   2. Create or reuse a local .venv
-echo   3. Install PyTorch CUDA 12.8 wheels
+echo   3. Install PyTorch ^(CUDA 12.8 or CPU-only^)
 echo   4. Install the vendored ml-sharp package into the venv
-echo   5. Clone or update SeedVR2 and install runtime extras
+echo   5. Install core runtime extras and optionally SeedVR2
 echo   6. Install ImageMagick into third_party\ImageMagick
 echo   7. Download the default DA360 checkpoint for depth alignment
 echo   8. Create a Send To shortcut for SHARP_360_to_Splat
@@ -74,6 +82,9 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+call :resolve_install_profile
+if errorlevel 1 goto fail
 
 echo.
 echo [1/8] Checking for git...
@@ -119,19 +130,40 @@ if "%DRY_RUN%"=="1" (
 
 echo.
 echo [4/8] Installing PyTorch with CUDA 12.8 support...
-echo       IMPORTANT: This must happen before ml-sharp to avoid CPU-only torch.
-echo       This may take a few minutes...
-if "%DRY_RUN%"=="1" (
-    echo       [dry-run] "%PYTHON_EXE%" -m pip install %TORCH_PINNED% --index-url "%TORCH_INDEX_URL%"
-    echo       [dry-run] fallback: "%PYTHON_EXE%" -m pip install torch torchvision torchaudio --index-url "%TORCH_INDEX_URL%"
+if "%CPU_ONLY%"=="1" (
+    echo [4/8] Installing PyTorch CPU-only wheels...
 ) else (
-    "%PYTHON_EXE%" -m pip install %TORCH_PINNED% --index-url "%TORCH_INDEX_URL%"
-    if errorlevel 1 (
-        echo.
-        echo WARNING: Pinned Torch 2.8.0 CUDA 12.8 wheels not available.
-        echo          Trying the latest CUDA 12.8 wheels instead...
-        "%PYTHON_EXE%" -m pip install torch torchvision torchaudio --index-url "%TORCH_INDEX_URL%"
-        if errorlevel 1 goto fail
+    echo [4/8] Installing PyTorch with CUDA 12.8 support...
+)
+echo       IMPORTANT: This must happen before ml-sharp so the intended torch build is selected.
+echo       This may take a few minutes...
+if "%CPU_ONLY%"=="1" (
+    if "%DRY_RUN%"=="1" (
+        echo       [dry-run] "%PYTHON_EXE%" -m pip install %TORCH_PINNED% --index-url "%TORCH_CPU_INDEX_URL%"
+        echo       [dry-run] fallback: "%PYTHON_EXE%" -m pip install torch torchvision torchaudio --index-url "%TORCH_CPU_INDEX_URL%"
+    ) else (
+        "%PYTHON_EXE%" -m pip install %TORCH_PINNED% --index-url "%TORCH_CPU_INDEX_URL%"
+        if errorlevel 1 (
+            echo.
+            echo WARNING: Pinned Torch 2.8.0 CPU wheels not available.
+            echo          Trying the latest CPU wheels instead...
+            "%PYTHON_EXE%" -m pip install torch torchvision torchaudio --index-url "%TORCH_CPU_INDEX_URL%"
+            if errorlevel 1 goto fail
+        )
+    )
+) else (
+    if "%DRY_RUN%"=="1" (
+        echo       [dry-run] "%PYTHON_EXE%" -m pip install %TORCH_PINNED% --index-url "%TORCH_CUDA_INDEX_URL%"
+        echo       [dry-run] fallback: "%PYTHON_EXE%" -m pip install torch torchvision torchaudio --index-url "%TORCH_CUDA_INDEX_URL%"
+    ) else (
+        "%PYTHON_EXE%" -m pip install %TORCH_PINNED% --index-url "%TORCH_CUDA_INDEX_URL%"
+        if errorlevel 1 (
+            echo.
+            echo WARNING: Pinned Torch 2.8.0 CUDA 12.8 wheels not available.
+            echo          Trying the latest CUDA 12.8 wheels instead...
+            "%PYTHON_EXE%" -m pip install torch torchvision torchaudio --index-url "%TORCH_CUDA_INDEX_URL%"
+            if errorlevel 1 goto fail
+        )
     )
 )
 
@@ -145,37 +177,46 @@ if "%DRY_RUN%"=="1" (
     if errorlevel 1 goto fail
 )
 
-echo       Installing DA360/runtime extras used by this repo...
+echo       Installing core runtime extras used by this repo...
 if "%DRY_RUN%"=="1" (
     echo       [dry-run] "%PYTHON_EXE%" -m pip install opencv-python gdown
-    echo       [dry-run] "%PYTHON_EXE%" -m pip install "%TRITON_PINNED%"
-    echo       [dry-run] git clone "%SEEDVR2_REPO%" "%SEEDVR2_DIR%"
-    echo       [dry-run] "%PYTHON_EXE%" -m pip install -r "%SEEDVR2_DIR%\requirements.txt"
 ) else (
     "%PYTHON_EXE%" -m pip install opencv-python gdown
     if errorlevel 1 goto fail
-    "%PYTHON_EXE%" -m pip install "%TRITON_PINNED%"
-    if errorlevel 1 goto fail
+)
 
-    if exist "%SEEDVR2_DIR%\.git" (
-        echo       Updating SeedVR2 checkout...
-        git -C "%SEEDVR2_DIR%" pull --ff-only
-        if errorlevel 1 goto fail
-    ) else if exist "%SEEDVR2_DIR%" (
-        echo ERROR: "%SEEDVR2_DIR%" exists but is not a Git checkout.
-        echo        Delete or rename it, then rerun Setup_NewPC.bat.
-        goto fail
+if "%INSTALL_SEEDVR2%"=="1" (
+    echo       Installing optional SeedVR2 support...
+    if "%DRY_RUN%"=="1" (
+        echo       [dry-run] "%PYTHON_EXE%" -m pip install "%TRITON_PINNED%"
+        echo       [dry-run] git clone "%SEEDVR2_REPO%" "%SEEDVR2_DIR%"
+        echo       [dry-run] "%PYTHON_EXE%" -m pip install -r "%SEEDVR2_DIR%\requirements.txt"
     ) else (
-        echo       Cloning SeedVR2 from %SEEDVR2_REPO% ...
-        git clone "%SEEDVR2_REPO%" "%SEEDVR2_DIR%"
+        "%PYTHON_EXE%" -m pip install "%TRITON_PINNED%"
+        if errorlevel 1 goto fail
+
+        if exist "%SEEDVR2_DIR%\.git" (
+            echo       Updating SeedVR2 checkout...
+            git -C "%SEEDVR2_DIR%" pull --ff-only
+            if errorlevel 1 goto fail
+        ) else if exist "%SEEDVR2_DIR%" (
+            echo ERROR: "%SEEDVR2_DIR%" exists but is not a Git checkout.
+            echo        Delete or rename it, then rerun Setup_NewPC.bat.
+            goto fail
+        ) else (
+            echo       Cloning SeedVR2 from %SEEDVR2_REPO% ...
+            git clone "%SEEDVR2_REPO%" "%SEEDVR2_DIR%"
+            if errorlevel 1 goto fail
+        )
+
+        echo       Installing SeedVR2 Python requirements...
+        "%PYTHON_EXE%" -m pip install -r "%SEEDVR2_DIR%\requirements.txt"
         if errorlevel 1 goto fail
     )
-
-    echo       Installing SeedVR2 Python requirements...
-    "%PYTHON_EXE%" -m pip install -r "%SEEDVR2_DIR%\requirements.txt"
-    if errorlevel 1 goto fail
-    echo       OK - runtime dependencies installed.
+) else (
+    echo       Skipping optional SeedVR2 install.
 )
+echo       OK - runtime dependencies installed.
 
 echo.
 echo [6/8] Ensuring ImageMagick is available...
@@ -282,6 +323,62 @@ echo.
 echo   --dry-run           Show what would happen without changing anything.
 echo   --skip-checkpoint   Skip downloading checkpoints\DA360_large.pth.
 echo   --skip-models       Alias for --skip-checkpoint.
+echo   --skip-seedvr2      Do not clone or install SeedVR2 support.
+echo   --with-seedvr2      Force installation of SeedVR2 support without prompting.
+echo   --cpu-only          Install CPU-only PyTorch wheels.
+echo   --no-cuda           Alias for --cpu-only.
+echo   --with-cuda         Force CUDA PyTorch wheels without prompting.
+exit /b 0
+
+:resolve_install_profile
+if /I "%CPU_ONLY%"=="ask" (
+    if "%DRY_RUN%"=="1" (
+        set "CPU_ONLY=0"
+        echo       [dry-run] Defaulting to CUDA-enabled torch.
+    ) else (
+        echo.
+        choice /C GC /N /M "Install GPU CUDA torch or CPU-only torch? [G/C]"
+        if errorlevel 2 (
+            set "CPU_ONLY=1"
+        ) else (
+            set "CPU_ONLY=0"
+        )
+    )
+)
+
+if /I "%INSTALL_SEEDVR2%"=="ask" (
+    if "%CPU_ONLY%"=="1" (
+        set "INSTALL_SEEDVR2=0"
+        echo       CPU-only profile selected; SeedVR2 install will be skipped.
+    ) else if "%DRY_RUN%"=="1" (
+        set "INSTALL_SEEDVR2=0"
+        echo       [dry-run] Defaulting to no SeedVR2 install.
+    ) else (
+        echo.
+        choice /C YN /N /M "Install optional SeedVR2 support now? [Y/N]"
+        if errorlevel 2 (
+            set "INSTALL_SEEDVR2=0"
+        ) else (
+            set "INSTALL_SEEDVR2=1"
+        )
+    )
+)
+
+if "%CPU_ONLY%"=="1" if "%INSTALL_SEEDVR2%"=="1" (
+    echo       WARNING: SeedVR2 is GPU-oriented and will be skipped in CPU-only mode.
+    set "INSTALL_SEEDVR2=0"
+)
+
+if "%CPU_ONLY%"=="1" (
+    echo       Install profile: CPU-only torch.
+) else (
+    echo       Install profile: CUDA torch.
+)
+if "%INSTALL_SEEDVR2%"=="1" (
+    echo       SeedVR2 support: enabled.
+) else (
+    echo       SeedVR2 support: skipped.
+)
 exit /b 0
 
 :detect_python

@@ -1,5 +1,19 @@
 # Build Notes
 
+## v1.5.3 Release Notes
+
+### Packaging changes
+
+1. `Setup_NewPC.bat` now prompts for CUDA vs CPU-only torch and for optional SeedVR2 installation unless explicit flags are provided.
+2. The release build now produces two zip assets: the standard Windows package and a smaller starter package.
+3. The starter package swaps in a beginner `Setup_NewPC.bat` wrapper that defaults to CPU-only torch, no SeedVR2, and no DA360 checkpoint download.
+
+### Behavior changes worth verifying before release
+
+1. If SeedVR2 was not installed, enabling it at runtime now raises a direct setup-needed error instead of failing obscurely.
+2. The starter package uses `insp_settings_starter.json` so DA360 is disabled by default and overlap alignment is selected instead.
+3. The standard package still keeps the lightweight EXE model and does not bundle torch, CUDA, or SeedVR2 payloads.
+
 ## v1.5.2 Release Notes
 
 ### Packaging changes

@@ -844,6 +844,10 @@ def upscale_faces_with_seedvr2(
     image_height: int,
     temp_root: Path,
 ) -> tuple[dict[str, np.ndarray], int, int]:
+    if not SEEDVR2_CLI_PATH.exists():
+        raise FileNotFoundError(
+            "SeedVR2 is not installed. Run Setup_NewPC.bat and enable SeedVR2 support, or disable SeedVR2 upscaling in the GUI."
+        )
     settings = load_seedvr2_settings()
     seedvr2_base_width, seedvr2_base_height, downscale_factor = resolve_seedvr2_downscale_dimensions(
         image_width,

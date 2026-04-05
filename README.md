@@ -61,6 +61,8 @@ Compressed exports require `gsbox.exe`.
 
 For release packages, `SHARP_360_to_Splat.exe` is a lightweight launcher. It does not bundle `torch`, CUDA wheels, or the full runtime stack into the EXE itself. Instead, those dependencies are installed into the local `.venv` by `Setup_NewPC.bat`, either ahead of time or on first launch.
 
+The standard setup now asks whether SeedVR2 should be installed. A separate beginner profile is also available through `Setup_Beginner_NoSeedVR2.bat`, which installs CPU-only torch, skips SeedVR2, and skips the automatic DA360 checkpoint download.
+
 ## Setup Details
 
 `Setup_NewPC.bat` prepares a local portable-style environment for this repo.
@@ -69,9 +71,9 @@ It will:
 
 1. Detect Python 3.13
 2. Create or reuse `.venv`
-3. Install PyTorch CUDA 12.8 wheels
+3. Install PyTorch either with CUDA 12.8 or in CPU-only mode
 4. Install the vendored `ml-sharp` package in editable mode
-5. Clone or update `seedvr2_videoupscaler` from its upstream repository and install its Python requirements
+5. Install core runtime extras and optionally clone or update `seedvr2_videoupscaler`
 6. Download and install ImageMagick into `third_party/ImageMagick`
 7. Download the default DA360 checkpoint into `checkpoints/DA360_large.pth`
 8. Create a Windows Send To shortcut for SHARP_360_to_Splat
@@ -80,6 +82,12 @@ Supported setup flags:
 
 - `--dry-run`
 - `--skip-checkpoint`
+- `--skip-seedvr2`
+- `--with-seedvr2`
+- `--cpu-only`
+- `--with-cuda`
+
+If you run `Setup_NewPC.bat` without flags, it now prompts for the torch profile and whether SeedVR2 should be installed.
 
 ## GUI Workflow
 
@@ -160,6 +168,8 @@ Perspective faces keep the panorama-derived vertical coverage by default instead
 
 SeedVR2 is not vendored into the main repository. Setup clones it from its upstream repository and installs its runtime dependencies locally.
 
+If SeedVR2 support was skipped during setup, enabling SeedVR2 in the GUI will now fail with a direct message telling you to rerun setup with SeedVR2 enabled or disable the option.
+
 In the GUI you can enable face upscaling before SHARP prediction and configure key SeedVR2 parameters such as:
 
 - model
@@ -204,20 +214,26 @@ The build script:
 
 1. Installs PyInstaller into the local environment
 2. Builds a lightweight `SHARP_360_to_Splat.exe` bootstrap launcher
-3. Assembles a release folder under `release_pkg/`
-4. Copies the Python source files and vendored `ml-sharp` tree required by setup/runtime
-5. Bundles DA360 assets and optional extras
-6. Creates a zip archive for distribution
-
-If `third_party/ImageMagick` exists locally at build time, it is bundled into the release package as well.
+3. Assembles a standard release folder under `release_pkg/`
+4. Assembles a smaller starter release folder under `release_pkg/`
+5. Copies the Python source files and vendored `ml-sharp` tree required by setup/runtime
+6. Bundles DA360 assets and optional extras only into the standard package
+7. Creates zip archives for distribution
 
 The packaged EXE intentionally does not embed `torch`, `torchvision`, `torchaudio`, CUDA wheels, or the rest of the heavy Python runtime payload. Those are installed locally by `Setup_NewPC.bat` on the target machine.
 
+Release packages also do not bundle ImageMagick anymore. Setup installs it locally when needed.
+
+The starter package also avoids bundling DA360 assets, the DA360 checkpoint, and the viewer payload. It ships a beginner `Setup_NewPC.bat` wrapper that defaults to CPU-only torch and no SeedVR2.
+
 ## Release Package Contents
+
+Standard package:
 
 - `SHARP_360_to_Splat.exe`
 - `!Launch_SHARP_360_to_Splat.bat`
 - `Setup_NewPC.bat`
+- `Setup_Beginner_NoSeedVR2.bat`
 - `Easy_360_SHARP_GUI.py`
 - `insp_to_splat.py`
 - `insp_settings.json`
@@ -225,9 +241,29 @@ The packaged EXE intentionally does not embed `torch`, `torchvision`, `torchaudi
 - `ml-sharp/`
 - `gsbox.exe`
 - `third_party/DA360/`
-- `third_party/ImageMagick/` when a local repo-managed ImageMagick install is present at build time
 - `checkpoints/DA360_large.pth` when available at build time
 - `splatapult/build/Release/`
+
+Starter package:
+
+- `SHARP_360_to_Splat.exe`
+- `!Launch_SHARP_360_to_Splat.bat`
+- `Setup_NewPC.bat` as the beginner CPU-only no-SeedVR2 wrapper
+- `Setup_Advanced_Full.bat` for the full interactive setup
+- `Setup_Beginner_NoSeedVR2.bat`
+- `Easy_360_SHARP_GUI.py`
+- `insp_to_splat.py`
+- `insp_settings.json` with DA360 disabled and overlap alignment selected by default
+- `seedvr2_settings.json`
+- `ml-sharp/`
+- `gsbox.exe`
+
+Starter package omissions:
+
+- no bundled DA360 assets
+- no bundled DA360 checkpoint
+- no bundled ImageMagick runtime
+- no bundled viewer payload
 
 ## Repository Layout
 
